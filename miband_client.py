@@ -6,7 +6,7 @@ import os
 from typing import Callable, Optional
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from dotenv import load_dotenv
-from bleak import BleakClient
+from bleak import BleakClient, BleakScanner
 
 # Configure logging
 logging.basicConfig(
@@ -74,7 +74,8 @@ class MiBand6Client:
             random_challenge = bytes(data[3:19])
             logger.info("Received challenge salt from band: %s", random_challenge.hex())
             encrypted_salt = encrypt_challenge(self.auth_key, random_challenge)
-            response = b"\x03\x08" + encrypted_salt
+            auth_b = getattr(self, "_auth_byte", b"\x08")
+            response = b"\x03" + auth_b + encrypted_salt
             logger.info("Sending encrypted challenge response to band...")
             await self.client.write_gatt_char(UUID_CHAR_HUAMI_AUTH, response, response=False)
 
@@ -103,24 +104,41 @@ class MiBand6Client:
         except Exception as exc:
             logger.error("Failed to parse heart rate measurement: %s", exc)
 
-    async def connect_and_authenticate(self, timeout_seconds: float = 20.0) -> None:
+    async def connect_and_authenticate(self, timeout_seconds: float = 25.0) -> None:
         """Establish BLE connection and execute Huami authentication handshake."""
-        logger.info("Connecting to Mi Band at %s...", self.mac_address)
+        logger.info("Scanning for Mi Band at %s...", self.mac_address)
+        device = await BleakScanner.find_device_by_address(self.mac_address, timeout=10.0)
+        if device is None:
+            logger.warning("Device not found during quick scan, attempting direct connect...")
+            target = self.mac_address
+        else:
+            logger.info("Device discovered! RSSI: %s dBm", getattr(device, "rssi", "N/A"))
+            target = device
+
+        self.client = BleakClient(target)
         await self.client.connect()
         logger.info("BLE link established. Initializing auth service listener...")
 
         await self.client.start_notify(UUID_CHAR_HUAMI_AUTH, self._on_auth_notification)
 
-        # Trigger random challenge request (0x02, 0x08)
+        # Trigger random challenge request (try 0x02, 0x08)
         self._auth_event.clear()
         self._auth_error = None
-        logger.info("Requesting random auth challenge from band...")
+        self._auth_byte = b"\x08"
+        logger.info("Requesting random auth challenge from band [0x02, 0x08]...")
         await self.client.write_gatt_char(UUID_CHAR_HUAMI_AUTH, b"\x02\x08", response=False)
 
         try:
             await asyncio.wait_for(self._auth_event.wait(), timeout=timeout_seconds)
         except asyncio.TimeoutError:
-            raise TimeoutError("Authentication timed out waiting for device challenge response.")
+            # Fallback retry with 0x02, 0x00 if band uses alternative auth byte
+            logger.warning("No response for [0x02, 0x08], retrying with [0x02, 0x00]...")
+            self._auth_byte = b"\x00"
+            await self.client.write_gatt_char(UUID_CHAR_HUAMI_AUTH, b"\x02\x00", response=False)
+            try:
+                await asyncio.wait_for(self._auth_event.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                raise TimeoutError("Authentication timed out waiting for device challenge response.")
 
         if self._auth_error:
             raise RuntimeError(f"Authentication failed: {self._auth_error}")
