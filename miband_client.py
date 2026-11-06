@@ -220,16 +220,21 @@ class MiBand6Client:
 
     async def connect_and_authenticate(self, timeout_seconds: float = 30.0) -> None:
         """Establish BLE connection and execute Chunked Transfer ECDH authentication."""
-        logger.info("Scanning for Mi Band at %s...", self.mac_address)
-        device = await BleakScanner.find_device_by_address(self.mac_address, timeout=10.0)
-        if device is None:
-            logger.warning("Device not discovered during quick scan, attempting direct connect...")
-            target = self.mac_address
-        else:
-            logger.info("Device discovered! RSSI: %s dBm", getattr(device, "rssi", "N/A"))
-            target = device
+        logger.info("Waiting for Mi Band broadcast at %s (please touch/light up band screen)...", self.mac_address)
+        device = None
+        for attempt in range(6):
+            device = await BleakScanner.find_device_by_address(self.mac_address, timeout=5.0)
+            if device:
+                break
+            logger.info("Searching for band... (%d/6, tap band screen to wake up)", attempt + 1)
 
-        self.client = BleakClient(target)
+        if device is None:
+            raise TimeoutError(
+                f"Could not discover band {self.mac_address}. Please ensure the band screen is lit up and phone Bluetooth is off."
+            )
+
+        logger.info("Band detected! RSSI: %s dBm. Establishing BLE link...", getattr(device, "rssi", "N/A"))
+        self.client = BleakClient(device)
         await self.client.connect()
         logger.info("BLE link established. Initializing chunked transfer listener...")
 
