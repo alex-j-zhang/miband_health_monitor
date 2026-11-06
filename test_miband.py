@@ -1,7 +1,14 @@
 """Unit tests for Mi Band 6 client crypto, ECDH, and parser modules."""
 
 import pytest
-from miband_client import encrypt_challenge, parse_heart_rate, MiBand6Client
+import struct
+from miband_client import (
+    encrypt_challenge,
+    parse_heart_rate,
+    parse_realtime_steps,
+    parse_raw_sensor_data,
+    MiBand6Client,
+)
 from ecdh_wrapper import generate_ecdh_keys, compute_shared_secret
 
 
@@ -70,3 +77,65 @@ def test_client_initialization_key_formats():
 
     with pytest.raises(ValueError):
         MiBand6Client("00:11:22:33:44:55", "invalid_short_key")
+
+
+def test_parse_realtime_steps_valid():
+    """Verify parsing of 13-byte real-time steps packet."""
+    # steps = 1250 (0x04e2), distance = 850m (0x0352), calories = 45 kcal (0x002d)
+    packet = bytearray([
+        0x01,
+        0xe2, 0x04, 0x00, 0x00,
+        0x52, 0x03, 0x00, 0x00,
+        0x2d, 0x00, 0x00, 0x00,
+    ])
+    result = parse_realtime_steps(packet)
+    assert result["steps"] == 1250
+    assert result["distance_meters"] == 850
+    assert result["calories"] == 45
+
+
+def test_parse_realtime_steps_short_packet():
+    """Verify handling of truncated steps packets."""
+    short_valid = bytearray([0x01, 0x10, 0x27])  # 10000 steps (uint16)
+    result = parse_realtime_steps(short_valid)
+    assert result["steps"] == 10000
+    assert result["distance_meters"] == 0
+    assert result["calories"] == 0
+
+    with pytest.raises(ValueError):
+        parse_realtime_steps(bytearray([0x01]))
+
+
+def test_parse_raw_sensor_data_valid():
+    """Verify parsing of raw IMU 3-axis accelerometer packets."""
+    # type 0x01 (high freq ~25Hz, scale 256.0), seq 5
+    # sample 1: x = 0, y = 0, z = 256 (1.0g along z)
+    # sample 2: x = -128, y = 128, z = 0 (-0.5g along x, +0.5g along y)
+    payload = bytearray([0x01, 5])
+    payload += struct.pack("<hhh", 0, 0, 256)
+    payload += struct.pack("<hhh", -128, 128, 0)
+
+    result = parse_raw_sensor_data(payload)
+    assert result["type"] == 0x01
+    assert result["sequence"] == 5
+    assert result["sample_count"] == 2
+
+    s0 = result["samples"][0]
+    assert s0["x_raw"] == 0
+    assert s0["y_raw"] == 0
+    assert s0["z_raw"] == 256
+    assert s0["az_g"] == 1.0
+
+    s1 = result["samples"][1]
+    assert s1["ax_g"] == -0.5
+    assert s1["ay_g"] == 0.5
+
+
+def test_parse_raw_sensor_data_invalid():
+    """Verify error checking on malformed raw sensor packets."""
+    with pytest.raises(ValueError):
+        parse_raw_sensor_data(bytearray([0x01]))
+
+    # Payload length not divisible by 6 (7 bytes total, 5 payload bytes)
+    with pytest.raises(ValueError):
+        parse_raw_sensor_data(bytearray([0x01, 0x00, 1, 2, 3, 4, 5]))

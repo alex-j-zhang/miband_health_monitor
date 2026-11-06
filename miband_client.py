@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import struct
 import sys
 from typing import Callable, Optional
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -19,6 +20,9 @@ logger = logging.getLogger("MiBand6Client")
 
 # BLE GATT Service and Characteristic UUIDs
 UUID_SVC_MIBAND1 = "0000fee0-0000-1000-8000-00805f9b34fb"
+UUID_CHAR_RAW_SENSOR_CONTROL = "00000001-0000-3512-2118-0009af100700"
+UUID_CHAR_RAW_SENSOR_DATA = "00000002-0000-3512-2118-0009af100700"
+UUID_CHAR_STEPS = "00000007-0000-3512-2118-0009af100700"
 UUID_CHAR_CHUNKED_WRITE = "00000016-0000-3512-2118-0009af100700"
 UUID_CHAR_CHUNKED_READ = "00000017-0000-3512-2118-0009af100700"
 
@@ -27,6 +31,12 @@ UUID_CHAR_HR_MEASUREMENT = "00002a37-0000-1000-8000-00805f9b34fb"
 UUID_CHAR_HR_CONTROL = "00002a39-0000-1000-8000-00805f9b34fb"
 
 CHUNKED_ENDPOINT_AUTH = 0x82
+
+# Raw sensor activation opcodes from Huami2021 protocol
+CMD_RAW_SENSOR_START_1 = b"\x01\x03\x19"  # 25 Hz sampling rate
+CMD_RAW_SENSOR_START_2 = b"\x01\x03\x00\x00\x00\x19"
+CMD_RAW_SENSOR_START_3 = b"\x02"
+CMD_RAW_SENSOR_STOP = b"\x03"
 
 
 def encrypt_challenge(auth_key: bytes, challenge_bytes: bytes) -> bytes:
@@ -51,6 +61,76 @@ def parse_heart_rate(data: bytearray) -> int:
     if flags & 0x01 == 0:
         return int(data[1])
     return int.from_bytes(data[1:3], byteorder="little")
+
+
+def parse_realtime_steps(data: bytearray | bytes) -> dict:
+    """Parse real-time steps payload from characteristic 0x0007.
+
+    Typical 13-byte Huami format:
+    data[0]: status / mode
+    data[1:5]: current step count (uint32 little-endian, or uint16 at [1:3])
+    data[5:9]: meters / distance (uint32 little-endian)
+    data[9:13]: calories burned (uint32 little-endian)
+    """
+    if len(data) < 3:
+        raise ValueError(f"Real-time steps data too short: {len(data)} bytes")
+
+    if len(data) >= 5:
+        steps = int.from_bytes(data[1:5], byteorder="little")
+    else:
+        steps = int.from_bytes(data[1:3], byteorder="little")
+
+    distance_meters = int.from_bytes(data[5:9], byteorder="little") if len(data) >= 9 else 0
+    calories = int.from_bytes(data[9:13], byteorder="little") if len(data) >= 13 else 0
+
+    return {
+        "steps": steps,
+        "distance_meters": distance_meters,
+        "calories": calories,
+    }
+
+
+def parse_raw_sensor_data(data: bytearray | bytes) -> dict:
+    """Parse raw 3-axis accelerometer/IMU samples from characteristic 0x0002.
+
+    Byte 0: sensor frame type (0x00: 1Hz low-freq, 0x01: ~25Hz high-freq)
+    Byte 1: sequence counter (0-255 rolling index)
+    Bytes 2..end: 6-byte triplets (signed int16 x, y, z in little-endian)
+    """
+    if len(data) < 2:
+        raise ValueError(f"Raw sensor payload too short: {len(data)} bytes")
+
+    sensor_type = data[0]
+    seq_index = data[1]
+    payload = data[2:]
+
+    if len(payload) % 6 != 0:
+        raise ValueError(f"Sensor payload length ({len(payload)}) not divisible by 6")
+
+    scale_factor = 4100.0 if sensor_type == 0x00 else 256.0
+    gravity = 9.80665
+
+    samples = []
+    for i in range(0, len(payload), 6):
+        x, y, z = struct.unpack("<hhh", payload[i : i + 6])
+        samples.append({
+            "x_raw": x,
+            "y_raw": y,
+            "z_raw": z,
+            "ax_g": round(x / scale_factor, 4),
+            "ay_g": round(y / scale_factor, 4),
+            "az_g": round(z / scale_factor, 4),
+            "ax_ms2": round((x / scale_factor) * gravity, 4),
+            "ay_ms2": round((y / scale_factor) * gravity, 4),
+            "az_ms2": round((z / scale_factor) * gravity, 4),
+        })
+
+    return {
+        "type": sensor_type,
+        "sequence": seq_index,
+        "sample_count": len(samples),
+        "samples": samples,
+    }
 
 
 async def write_chunked_value(
@@ -115,7 +195,11 @@ class MiBand6Client:
         self._auth_event = asyncio.Event()
         self._auth_error: Optional[str] = None
         self._hr_callback: Optional[Callable[[int], None]] = None
+        self._steps_callback: Optional[Callable[[dict], None]] = None
+        self._sensor_callback: Optional[Callable[[dict], None]] = None
         self._keepalive_task: Optional[asyncio.Task] = None
+        self._steps_active: bool = False
+        self._sensor_active: bool = False
 
         self._handle = 0
         self._reassemble_buf = bytearray(512)
@@ -217,6 +301,40 @@ class MiBand6Client:
                 self._hr_callback(bpm)
         except Exception as exc:
             logger.error("Failed to parse heart rate measurement: %s", exc)
+
+    def _on_steps_notification(self, _sender, data: bytearray) -> None:
+        """Handle incoming real-time steps/calories notifications."""
+        try:
+            steps_info = parse_realtime_steps(data)
+            logger.info(
+                "👟 Steps: %d | Distance: %d m | Calories: %d kcal",
+                steps_info["steps"],
+                steps_info["distance_meters"],
+                steps_info["calories"],
+            )
+            if self._steps_callback:
+                self._steps_callback(steps_info)
+        except Exception as exc:
+            logger.error("Failed to parse realtime steps notification: %s", exc)
+
+    def _on_sensor_notification(self, _sender, data: bytearray) -> None:
+        """Handle incoming raw IMU accelerometer packets."""
+        try:
+            sensor_info = parse_raw_sensor_data(data)
+            if sensor_info["samples"]:
+                s0 = sensor_info["samples"][0]
+                logger.debug(
+                    "📊 IMU [Seq %d, %d samples] Accel: (%.2fg, %.2fg, %.2fg)",
+                    sensor_info["sequence"],
+                    sensor_info["sample_count"],
+                    s0["ax_g"],
+                    s0["ay_g"],
+                    s0["az_g"],
+                )
+            if self._sensor_callback:
+                self._sensor_callback(sensor_info)
+        except Exception as exc:
+            logger.error("Failed to parse raw sensor notification: %s", exc)
 
     async def connect_and_authenticate(self, timeout_seconds: float = 30.0) -> None:
         """Establish BLE connection and execute Chunked Transfer ECDH authentication."""
@@ -325,11 +443,58 @@ class MiBand6Client:
             logger.debug("Error while stopping notify: %s", exc)
 
     async def disconnect(self) -> None:
-        """Disconnect BLE client cleanly."""
+        """Disconnect BLE client cleanly and stop all active streams."""
         await self.stop_heart_rate_stream()
+        await self.stop_steps_stream()
+        await self.stop_raw_sensor_stream()
         if self.client.is_connected:
             await self.client.disconnect()
             logger.info("Disconnected from Mi Band.")
+
+    async def start_steps_stream(self, callback: Optional[Callable[[dict], None]] = None) -> None:
+        """Subscribe to real-time steps and calories notifications."""
+        self._steps_callback = callback
+        logger.info("Enabling real-time steps stream...")
+        try:
+            initial_data = await self.client.read_gatt_char(UUID_CHAR_STEPS)
+            if initial_data:
+                self._on_steps_notification(None, bytearray(initial_data))
+        except Exception as exc:
+            logger.debug("Failed initial steps read: %s", exc)
+
+        await self.client.start_notify(UUID_CHAR_STEPS, self._on_steps_notification)
+        self._steps_active = True
+        logger.info("Real-time steps notification active!")
+
+    async def stop_steps_stream(self) -> None:
+        """Stop real-time steps notification."""
+        if self._steps_active:
+            self._steps_active = False
+            try:
+                await self.client.stop_notify(UUID_CHAR_STEPS)
+            except Exception as exc:
+                logger.debug("Error while stopping steps notify: %s", exc)
+
+    async def start_raw_sensor_stream(self, callback: Optional[Callable[[dict], None]] = None) -> None:
+        """Activate raw IMU accelerometer streaming at ~25Hz."""
+        self._sensor_callback = callback
+        logger.info("Initializing raw IMU sensor stream...")
+        await self.client.write_gatt_char(UUID_CHAR_RAW_SENSOR_CONTROL, CMD_RAW_SENSOR_START_1, response=False)
+        await self.client.write_gatt_char(UUID_CHAR_RAW_SENSOR_CONTROL, CMD_RAW_SENSOR_START_2, response=False)
+        await self.client.write_gatt_char(UUID_CHAR_RAW_SENSOR_CONTROL, CMD_RAW_SENSOR_START_3, response=False)
+        await self.client.start_notify(UUID_CHAR_RAW_SENSOR_DATA, self._on_sensor_notification)
+        self._sensor_active = True
+        logger.info("Raw IMU sensor streaming active!")
+
+    async def stop_raw_sensor_stream(self) -> None:
+        """Stop raw IMU accelerometer stream."""
+        if self._sensor_active:
+            self._sensor_active = False
+            try:
+                await self.client.write_gatt_char(UUID_CHAR_RAW_SENSOR_CONTROL, CMD_RAW_SENSOR_STOP, response=False)
+                await self.client.stop_notify(UUID_CHAR_RAW_SENSOR_DATA)
+            except Exception as exc:
+                logger.debug("Error while stopping raw sensor stream: %s", exc)
 
 
 async def main() -> None:
@@ -346,7 +511,10 @@ async def main() -> None:
     try:
         await client.connect_and_authenticate()
         await client.start_heart_rate_stream()
-        logger.info("Heart rate streaming active. Press Ctrl+C to exit.")
+        await client.start_steps_stream()
+        # Raw high-frequency IMU stream (~25Hz) can also be enabled:
+        # await client.start_raw_sensor_stream()
+        logger.info("Real-time telemetry streams active (Heart Rate & Steps). Press Ctrl+C to exit.")
         while True:
             await asyncio.sleep(1)
     except (KeyboardInterrupt, asyncio.CancelledError):
