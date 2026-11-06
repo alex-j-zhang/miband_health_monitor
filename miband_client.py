@@ -403,7 +403,8 @@ class MiBand6Client:
             logger.debug("Notice while registering BlueZ agent: %s", e)
 
         # Event-driven continuous discovery: catches the band the instant screen lights up
-        logger.info("Waiting for Mi Band broadcast (please tap/light up the band screen now)...")
+        logger.info("Waiting for Mi Band broadcast at %s (60s timeout)...", self.mac_address)
+        logger.info("👉 PLEASE TAP / SLIDE THE BAND SCREEN NOW TO WAKE IT UP!")
         found_device = None
         detect_event = asyncio.Event()
         target_mac = self.mac_address.upper()
@@ -412,16 +413,16 @@ class MiBand6Client:
             nonlocal found_device
             if dev.address.upper() == target_mac:
                 found_device = dev
-                logger.info("Band detected! (RSSI: %s dBm). Connecting immediately...", getattr(adv, "rssi", "N/A"))
+                logger.info("✨ Band detected! (RSSI: %s dBm). Connecting immediately...", getattr(adv, "rssi", "N/A"))
                 detect_event.set()
 
         scanner = BleakScanner(detection_callback=_on_detected)
         await scanner.start()
         try:
-            await asyncio.wait_for(detect_event.wait(), timeout=30.0)
+            await asyncio.wait_for(detect_event.wait(), timeout=60.0)
         except asyncio.TimeoutError:
             raise TimeoutError(
-                f"Could not detect Mi Band {self.mac_address} within 30s. "
+                f"Could not detect Mi Band {self.mac_address} within 60s. "
                 "Please tap the band screen and ensure phone Bluetooth is off."
             )
         finally:
