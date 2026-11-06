@@ -402,27 +402,34 @@ class MiBand6Client:
         except Exception as e:
             logger.debug("Notice while registering BlueZ agent: %s", e)
 
-        connected = False
-        last_error = None
-        for attempt in range(1, 4):
-            try:
-                logger.info("Scanning and establishing BLE link (attempt %d/3)...", attempt)
-                device = await BleakScanner.find_device_by_address(self.mac_address, timeout=7.0)
-                target = device if device is not None else self.mac_address
-                self.client = BleakClient(target, timeout=15.0)
-                await self.client.connect()
-                connected = True
-                break
-            except Exception as e:
-                last_error = e
-                logger.warning("Connection attempt %d failed: %s. Retrying in 1.5s...", attempt, e)
-                await asyncio.sleep(1.5)
+        # Event-driven continuous discovery: catches the band the instant screen lights up
+        logger.info("Waiting for Mi Band broadcast (please tap/light up the band screen now)...")
+        found_device = None
+        detect_event = asyncio.Event()
+        target_mac = self.mac_address.upper()
 
-        if not connected:
+        def _on_detected(dev, adv):
+            nonlocal found_device
+            if dev.address.upper() == target_mac:
+                found_device = dev
+                logger.info("Band detected! (RSSI: %s dBm). Connecting immediately...", getattr(adv, "rssi", "N/A"))
+                detect_event.set()
+
+        scanner = BleakScanner(detection_callback=_on_detected)
+        await scanner.start()
+        try:
+            await asyncio.wait_for(detect_event.wait(), timeout=30.0)
+        except asyncio.TimeoutError:
             raise TimeoutError(
-                f"Failed to establish BLE link with {self.mac_address} after 3 attempts: {last_error}. "
-                "Ensure phone Bluetooth is disabled and keep the band screen awake."
+                f"Could not detect Mi Band {self.mac_address} within 30s. "
+                "Please tap the band screen and ensure phone Bluetooth is off."
             )
+        finally:
+            await scanner.stop()
+
+        logger.info("Establishing BLE link...")
+        self.client = BleakClient(found_device, timeout=20.0)
+        await self.client.connect()
 
         logger.info("BLE link established. Initializing chunked transfer listener...")
 
