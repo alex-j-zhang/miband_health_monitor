@@ -406,16 +406,17 @@ class MiBand6Client:
         last_error = None
         for attempt in range(1, 4):
             try:
-                logger.info("Establishing BLE link (attempt %d/3)...", attempt)
-                # Re-instantiate client per attempt to avoid stale DBus device paths
-                self.client = BleakClient(self.mac_address, timeout=15.0)
+                logger.info("Scanning and establishing BLE link (attempt %d/3)...", attempt)
+                device = await BleakScanner.find_device_by_address(self.mac_address, timeout=7.0)
+                target = device if device is not None else self.mac_address
+                self.client = BleakClient(target, timeout=15.0)
                 await self.client.connect()
                 connected = True
                 break
             except Exception as e:
                 last_error = e
-                logger.warning("Connection attempt %d failed: %s. Retrying in 2.0s...", attempt, e)
-                await asyncio.sleep(2.0)
+                logger.warning("Connection attempt %d failed: %s. Retrying in 1.5s...", attempt, e)
+                await asyncio.sleep(1.5)
 
         if not connected:
             raise TimeoutError(
