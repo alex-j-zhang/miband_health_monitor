@@ -338,27 +338,31 @@ class MiBand6Client:
 
     async def connect_and_authenticate(self, timeout_seconds: float = 30.0) -> None:
         """Establish BLE connection and execute Chunked Transfer ECDH authentication."""
-        logger.info("Waiting for Mi Band broadcast at %s (please touch/light up band screen)...", self.mac_address)
+        logger.info("Connecting to Mi Band %s (please keep screen touched/awake)...", self.mac_address)
+        target_mac = self.mac_address.upper()
         device = None
-        for attempt in range(6):
-            device = await BleakScanner.find_device_by_address(self.mac_address, timeout=5.0)
-            if device:
-                break
-            logger.info("Searching for band... (%d/6, tap band screen to wake up)", attempt + 1)
+
+        try:
+            discovered = await BleakScanner.discover(timeout=5.0)
+            for d in discovered:
+                if d.address.upper() == target_mac:
+                    device = d
+                    logger.info("Band discovered in BLE broadcast scan (RSSI: %s dBm).", getattr(d, 'rssi', 'N/A'))
+                    break
+        except Exception as scan_err:
+            logger.debug("Broadcast scan notice: %s", scan_err)
 
         if device is None:
-            raise TimeoutError(
-                f"Could not discover band {self.mac_address}. Please ensure the band screen is lit up and phone Bluetooth is off."
-            )
+            logger.info("Directly connecting to MAC address %s...", self.mac_address)
+            device = self.mac_address
 
-        logger.info("Band detected! Establishing BLE link (please keep touching screen to prevent sleep)...")
         self.client = BleakClient(device, timeout=20.0)
 
         connected = False
         last_error = None
         for attempt in range(1, 4):
             try:
-                logger.info("Connecting to band (attempt %d/3)...", attempt)
+                logger.info("Establishing BLE link (attempt %d/3)...", attempt)
                 await self.client.connect()
                 connected = True
                 break
