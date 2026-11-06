@@ -35,3 +35,4 @@ async def scan_devices(duration_seconds: int = 8) -> None:
 
 if __name__ == "__main__":
     asyncio.run(scan_devices())
+

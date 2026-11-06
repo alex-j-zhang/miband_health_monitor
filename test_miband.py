@@ -56,3 +56,4 @@ def test_client_initialization_key_formats():
     # Invalid key length
     with pytest.raises(ValueError):
         MiBand6Client("00:11:22:33:44:55", "invalid_short_key")
+
