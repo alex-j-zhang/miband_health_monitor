@@ -7,6 +7,9 @@ import struct
 import sys
 from typing import Callable, Optional
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from dbus_fast import BusType
+from dbus_fast.aio import MessageBus
+from dbus_fast.service import ServiceInterface, method
 from dotenv import load_dotenv
 from bleak import BleakClient, BleakScanner
 from ecdh_wrapper import generate_ecdh_keys, compute_shared_secret
@@ -37,6 +40,49 @@ CMD_RAW_SENSOR_START_1 = b"\x01\x03\x19"  # 25 Hz sampling rate
 CMD_RAW_SENSOR_START_2 = b"\x01\x03\x00\x00\x00\x19"
 CMD_RAW_SENSOR_START_3 = b"\x02"
 CMD_RAW_SENSOR_STOP = b"\x03"
+
+
+class BluezAgent(ServiceInterface):
+    """Auto-confirming BlueZ pairing/authorization agent."""
+
+    def __init__(self):
+        super().__init__("org.bluez.Agent1")
+
+    @method()
+    def Release(self):
+        pass
+
+    @method()
+    def RequestPinCode(self, device: "o") -> "s":
+        return "0000"
+
+    @method()
+    def DisplayPinCode(self, device: "o", pincode: "s"):
+        pass
+
+    @method()
+    def RequestPasskey(self, device: "o") -> "u":
+        return 0
+
+    @method()
+    def DisplayPasskey(self, device: "o", passkey: "u", entered: "q"):
+        pass
+
+    @method()
+    def RequestConfirmation(self, device: "o", passkey: "u"):
+        return
+
+    @method()
+    def RequestAuthorization(self, device: "o"):
+        return
+
+    @method()
+    def AuthorizeService(self, device: "o", uuid: "s"):
+        return
+
+    @method()
+    def Cancel(self):
+        pass
 
 
 def encrypt_challenge(auth_key: bytes, challenge_bytes: bytes) -> bytes:
@@ -200,6 +246,8 @@ class MiBand6Client:
         self._keepalive_task: Optional[asyncio.Task] = None
         self._steps_active: bool = False
         self._sensor_active: bool = False
+        self._dbus: Optional[MessageBus] = None
+        self._agent_path: str = "/miband/bluez_agent"
 
         self._handle = 0
         self._reassemble_buf = bytearray(512)
@@ -339,37 +387,35 @@ class MiBand6Client:
     async def connect_and_authenticate(self, timeout_seconds: float = 30.0) -> None:
         """Establish BLE connection and execute Chunked Transfer ECDH authentication."""
         logger.info("Connecting to Mi Band %s (please keep screen touched/awake)...", self.mac_address)
-        target_mac = self.mac_address.upper()
-        device = None
 
+        # Register BlueZ pairing agent if running on Linux
         try:
-            discovered = await BleakScanner.discover(timeout=5.0)
-            for d in discovered:
-                if d.address.upper() == target_mac:
-                    device = d
-                    logger.info("Band discovered in BLE broadcast scan (RSSI: %s dBm).", getattr(d, 'rssi', 'N/A'))
-                    break
-        except Exception as scan_err:
-            logger.debug("Broadcast scan notice: %s", scan_err)
-
-        if device is None:
-            logger.info("Directly connecting to MAC address %s...", self.mac_address)
-            device = self.mac_address
-
-        self.client = BleakClient(device, timeout=20.0)
+            self._dbus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            agent = BluezAgent()
+            self._dbus.export(self._agent_path, agent)
+            introspection = await self._dbus.introspect("org.bluez", "/org/bluez")
+            proxy = self._dbus.get_proxy_object("org.bluez", "/org/bluez", introspection)
+            agent_mgr = proxy.get_interface("org.bluez.AgentManager1")
+            await agent_mgr.call_register_agent(self._agent_path, "NoInputNoOutput")
+            await agent_mgr.call_request_default_agent(self._agent_path)
+            logger.debug("BlueZ pairing agent registered successfully.")
+        except Exception as e:
+            logger.debug("Notice while registering BlueZ agent: %s", e)
 
         connected = False
         last_error = None
         for attempt in range(1, 4):
             try:
                 logger.info("Establishing BLE link (attempt %d/3)...", attempt)
+                # Re-instantiate client per attempt to avoid stale DBus device paths
+                self.client = BleakClient(self.mac_address, timeout=15.0)
                 await self.client.connect()
                 connected = True
                 break
             except Exception as e:
                 last_error = e
-                logger.warning("Connection attempt %d failed: %s. Retrying in 1.5s...", attempt, e)
-                await asyncio.sleep(1.5)
+                logger.warning("Connection attempt %d failed: %s. Retrying in 2.0s...", attempt, e)
+                await asyncio.sleep(2.0)
 
         if not connected:
             raise TimeoutError(
@@ -451,9 +497,20 @@ class MiBand6Client:
         await self.stop_heart_rate_stream()
         await self.stop_steps_stream()
         await self.stop_raw_sensor_stream()
-        if self.client.is_connected:
+        if self.client and self.client.is_connected:
             await self.client.disconnect()
             logger.info("Disconnected from Mi Band.")
+
+        if self._dbus:
+            try:
+                introspection = await self._dbus.introspect("org.bluez", "/org/bluez")
+                proxy = self._dbus.get_proxy_object("org.bluez", "/org/bluez", introspection)
+                agent_mgr = proxy.get_interface("org.bluez.AgentManager1")
+                await agent_mgr.call_unregister_agent(self._agent_path)
+            except Exception:
+                pass
+            self._dbus.disconnect()
+            self._dbus = None
 
     async def start_steps_stream(self, callback: Optional[Callable[[dict], None]] = None) -> None:
         """Subscribe to real-time steps and calories notifications."""
