@@ -507,16 +507,29 @@ async def main() -> None:
         logger.error("Please configure DEVICE_MAC and AUTH_KEY in .env before running.")
         return
 
+    # Check CLI options
+    duration: Optional[int] = None
+    for arg in sys.argv[1:]:
+        if arg.isdigit():
+            duration = int(arg)
+            break
+    enable_imu = "--imu" in sys.argv
+
     client = MiBand6Client(mac, key)
     try:
         await client.connect_and_authenticate()
         await client.start_heart_rate_stream()
         await client.start_steps_stream()
-        # Raw high-frequency IMU stream (~25Hz) can also be enabled:
-        # await client.start_raw_sensor_stream()
-        logger.info("Real-time telemetry streams active (Heart Rate & Steps). Press Ctrl+C to exit.")
-        while True:
-            await asyncio.sleep(1)
+        if enable_imu:
+            await client.start_raw_sensor_stream()
+
+        if duration:
+            logger.info("Real-time telemetry streams active. Collecting for %d seconds...", duration)
+            await asyncio.sleep(duration)
+        else:
+            logger.info("Real-time telemetry streams active. Press Ctrl+C to exit.")
+            while True:
+                await asyncio.sleep(1)
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Exiting on user request...")
     finally:
