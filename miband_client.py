@@ -233,9 +233,28 @@ class MiBand6Client:
                 f"Could not discover band {self.mac_address}. Please ensure the band screen is lit up and phone Bluetooth is off."
             )
 
-        logger.info("Band detected! RSSI: %s dBm. Establishing BLE link...", getattr(device, "rssi", "N/A"))
-        self.client = BleakClient(device)
-        await self.client.connect()
+        logger.info("Band detected! Establishing BLE link (please keep touching screen to prevent sleep)...")
+        self.client = BleakClient(device, timeout=20.0)
+
+        connected = False
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                logger.info("Connecting to band (attempt %d/3)...", attempt)
+                await self.client.connect()
+                connected = True
+                break
+            except Exception as e:
+                last_error = e
+                logger.warning("Connection attempt %d failed: %s. Retrying in 1.5s...", attempt, e)
+                await asyncio.sleep(1.5)
+
+        if not connected:
+            raise TimeoutError(
+                f"Failed to establish BLE link with {self.mac_address} after 3 attempts: {last_error}. "
+                "Ensure phone Bluetooth is disabled and keep the band screen awake."
+            )
+
         logger.info("BLE link established. Initializing chunked transfer listener...")
 
         await self.client.start_notify(UUID_CHAR_CHUNKED_READ, self._on_chunked_notification)
