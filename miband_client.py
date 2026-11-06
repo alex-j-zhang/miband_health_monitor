@@ -7,9 +7,6 @@ import struct
 import sys
 from typing import Callable, Optional
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from dbus_fast import BusType
-from dbus_fast.aio import MessageBus
-from dbus_fast.service import ServiceInterface, method
 from dotenv import load_dotenv
 from bleak import BleakClient, BleakScanner
 from ecdh_wrapper import generate_ecdh_keys, compute_shared_secret
@@ -40,49 +37,6 @@ CMD_RAW_SENSOR_START_1 = b"\x01\x03\x19"  # 25 Hz sampling rate
 CMD_RAW_SENSOR_START_2 = b"\x01\x03\x00\x00\x00\x19"
 CMD_RAW_SENSOR_START_3 = b"\x02"
 CMD_RAW_SENSOR_STOP = b"\x03"
-
-
-class BluezAgent(ServiceInterface):
-    """Auto-confirming BlueZ pairing/authorization agent."""
-
-    def __init__(self):
-        super().__init__("org.bluez.Agent1")
-
-    @method()
-    def Release(self):
-        pass
-
-    @method()
-    def RequestPinCode(self, device: "o") -> "s":
-        return "0000"
-
-    @method()
-    def DisplayPinCode(self, device: "o", pincode: "s"):
-        pass
-
-    @method()
-    def RequestPasskey(self, device: "o") -> "u":
-        return 0
-
-    @method()
-    def DisplayPasskey(self, device: "o", passkey: "u", entered: "q"):
-        pass
-
-    @method()
-    def RequestConfirmation(self, device: "o", passkey: "u"):
-        return
-
-    @method()
-    def RequestAuthorization(self, device: "o"):
-        return
-
-    @method()
-    def AuthorizeService(self, device: "o", uuid: "s"):
-        return
-
-    @method()
-    def Cancel(self):
-        pass
 
 
 def encrypt_challenge(auth_key: bytes, challenge_bytes: bytes) -> bytes:
@@ -246,8 +200,6 @@ class MiBand6Client:
         self._keepalive_task: Optional[asyncio.Task] = None
         self._steps_active: bool = False
         self._sensor_active: bool = False
-        self._dbus: Optional[MessageBus] = None
-        self._agent_path: str = "/miband/bluez_agent"
 
         self._handle = 0
         self._reassemble_buf = bytearray(512)
@@ -386,51 +338,21 @@ class MiBand6Client:
 
     async def connect_and_authenticate(self, timeout_seconds: float = 30.0) -> None:
         """Establish BLE connection and execute Chunked Transfer ECDH authentication."""
-        logger.info("Connecting to Mi Band %s (please keep screen touched/awake)...", self.mac_address)
+        logger.info("Waiting for Mi Band broadcast at %s (please touch/light up band screen)...", self.mac_address)
+        device = None
+        for attempt in range(8):
+            device = await BleakScanner.find_device_by_address(self.mac_address, timeout=5.0)
+            if device:
+                break
+            logger.info("Searching for band... (%d/8, tap band screen to wake up)", attempt + 1)
 
-        # Register BlueZ pairing agent if running on Linux
-        try:
-            self._dbus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-            agent = BluezAgent()
-            self._dbus.export(self._agent_path, agent)
-            introspection = await self._dbus.introspect("org.bluez", "/org/bluez")
-            proxy = self._dbus.get_proxy_object("org.bluez", "/org/bluez", introspection)
-            agent_mgr = proxy.get_interface("org.bluez.AgentManager1")
-            await agent_mgr.call_register_agent(self._agent_path, "NoInputNoOutput")
-            await agent_mgr.call_request_default_agent(self._agent_path)
-            logger.debug("BlueZ pairing agent registered successfully.")
-        except Exception as e:
-            logger.debug("Notice while registering BlueZ agent: %s", e)
-
-        # Event-driven continuous discovery: catches the band the instant screen lights up
-        logger.info("Waiting for Mi Band broadcast at %s (60s timeout)...", self.mac_address)
-        logger.info("👉 PLEASE TAP / SLIDE THE BAND SCREEN NOW TO WAKE IT UP!")
-        found_device = None
-        detect_event = asyncio.Event()
-        target_mac = self.mac_address.upper()
-
-        def _on_detected(dev, adv):
-            nonlocal found_device
-            if dev.address.upper() == target_mac:
-                found_device = dev
-                logger.info("✨ Band detected! (RSSI: %s dBm). Connecting immediately...", getattr(adv, "rssi", "N/A"))
-                detect_event.set()
-
-        scanner = BleakScanner(detection_callback=_on_detected)
-        await scanner.start()
-        try:
-            await asyncio.wait_for(detect_event.wait(), timeout=60.0)
-        except asyncio.TimeoutError:
+        if device is None:
             raise TimeoutError(
-                f"Could not detect Mi Band {self.mac_address} within 60s. "
-                "Please tap the band screen and ensure phone Bluetooth is off."
+                f"Could not discover band {self.mac_address}. Please ensure the band screen is lit up and phone Bluetooth is off."
             )
-        finally:
-            await scanner.stop()
 
-        await asyncio.sleep(0.5)
-        logger.info("Establishing BLE link (if band vibrates or prompts '✔', please tap checkmark)...")
-        self.client = BleakClient(found_device, timeout=30.0)
+        logger.info("Band detected! RSSI: %s dBm. Establishing BLE link (keep screen awake)...", getattr(device, "rssi", "N/A"))
+        self.client = BleakClient(device, timeout=25.0)
         await self.client.connect()
 
         logger.info("BLE link established. Initializing chunked transfer listener...")
@@ -510,17 +432,6 @@ class MiBand6Client:
         if self.client and self.client.is_connected:
             await self.client.disconnect()
             logger.info("Disconnected from Mi Band.")
-
-        if self._dbus:
-            try:
-                introspection = await self._dbus.introspect("org.bluez", "/org/bluez")
-                proxy = self._dbus.get_proxy_object("org.bluez", "/org/bluez", introspection)
-                agent_mgr = proxy.get_interface("org.bluez.AgentManager1")
-                await agent_mgr.call_unregister_agent(self._agent_path)
-            except Exception:
-                pass
-            self._dbus.disconnect()
-            self._dbus = None
 
     async def start_steps_stream(self, callback: Optional[Callable[[dict], None]] = None) -> None:
         """Subscribe to real-time steps and calories notifications."""
