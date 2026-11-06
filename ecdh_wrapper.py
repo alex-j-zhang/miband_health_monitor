@@ -54,3 +54,4 @@ def compute_shared_secret(private_key: bytes, peer_public_key: bytes) -> bytes:
         (ctypes.c_char * 48).from_buffer(sec),
     )
     return bytes(sec)
+
