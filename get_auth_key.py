@@ -148,3 +148,4 @@ def run_extractor() -> int:
 
 if __name__ == "__main__":
     sys.exit(run_extractor())
+
