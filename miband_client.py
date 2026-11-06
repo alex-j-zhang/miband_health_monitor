@@ -428,8 +428,9 @@ class MiBand6Client:
         finally:
             await scanner.stop()
 
-        logger.info("Establishing BLE link...")
-        self.client = BleakClient(found_device, timeout=20.0)
+        await asyncio.sleep(0.5)
+        logger.info("Establishing BLE link (if band vibrates or prompts '✔', please tap checkmark)...")
+        self.client = BleakClient(found_device, timeout=30.0)
         await self.client.connect()
 
         logger.info("BLE link established. Initializing chunked transfer listener...")
