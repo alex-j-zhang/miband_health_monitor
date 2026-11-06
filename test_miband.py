@@ -1,7 +1,25 @@
-"""Unit tests for Mi Band 6 client crypto and parser modules."""
+"""Unit tests for Mi Band 6 client crypto, ECDH, and parser modules."""
 
 import pytest
 from miband_client import encrypt_challenge, parse_heart_rate, MiBand6Client
+from ecdh_wrapper import generate_ecdh_keys, compute_shared_secret
+
+
+def test_ecdh_key_exchange():
+    """Verify that ECDH key agreement generates matching shared secrets."""
+    prv_a, pub_a = generate_ecdh_keys()
+    prv_b, pub_b = generate_ecdh_keys()
+
+    assert len(prv_a) == 24
+    assert len(pub_a) == 48
+    assert len(prv_b) == 24
+    assert len(pub_b) == 48
+
+    sec_a = compute_shared_secret(prv_a, pub_b)
+    sec_b = compute_shared_secret(prv_b, pub_a)
+
+    assert len(sec_a) == 48
+    assert sec_a == sec_b
 
 
 def test_encrypt_challenge_valid():
@@ -25,14 +43,12 @@ def test_encrypt_challenge_invalid_length():
 
 def test_parse_heart_rate_uint8():
     """Verify parsing of 8-bit heart rate format."""
-    # Flag: 0x00 (uint8 format), BPM: 78
     raw_packet = bytearray([0x00, 78])
     assert parse_heart_rate(raw_packet) == 78
 
 
 def test_parse_heart_rate_uint16():
     """Verify parsing of 16-bit heart rate format."""
-    # Flag: 0x01 (uint16 format), BPM: 135 (0x0087)
     raw_packet = bytearray([0x01, 0x87, 0x00])
     assert parse_heart_rate(raw_packet) == 135
 
@@ -49,11 +65,8 @@ def test_client_initialization_key_formats():
     client = MiBand6Client("00:11:22:33:44:55", valid_key)
     assert client.auth_key == bytes.fromhex(valid_key)
 
-    # Prefix 0x handling
     client_prefixed = MiBand6Client("00:11:22:33:44:55", "0x" + valid_key)
     assert client_prefixed.auth_key == bytes.fromhex(valid_key)
 
-    # Invalid key length
     with pytest.raises(ValueError):
         MiBand6Client("00:11:22:33:44:55", "invalid_short_key")
-

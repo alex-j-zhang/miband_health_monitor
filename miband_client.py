@@ -1,12 +1,14 @@
-"""Mi Band 6 BLE client implementation for authentication and real-time health data streaming."""
+"""Mi Band 6 BLE client implementation with Chunked Transfer ECDH authentication."""
 
 import asyncio
 import logging
 import os
+import sys
 from typing import Callable, Optional
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from dotenv import load_dotenv
 from bleak import BleakClient, BleakScanner
+from ecdh_wrapper import generate_ecdh_keys, compute_shared_secret
 
 # Configure logging
 logging.basicConfig(
@@ -16,11 +18,15 @@ logging.basicConfig(
 logger = logging.getLogger("MiBand6Client")
 
 # BLE GATT Service and Characteristic UUIDs
-UUID_SVC_HUAMI_AUTH = "0000fee1-0000-1000-8000-00805f9b34fb"
-UUID_CHAR_HUAMI_AUTH = "00000009-0000-3512-2118-0009af100700"
+UUID_SVC_MIBAND1 = "0000fee0-0000-1000-8000-00805f9b34fb"
+UUID_CHAR_CHUNKED_WRITE = "00000016-0000-3512-2118-0009af100700"
+UUID_CHAR_CHUNKED_READ = "00000017-0000-3512-2118-0009af100700"
+
 UUID_SVC_HEART_RATE = "0000180d-0000-1000-8000-00805f9b34fb"
 UUID_CHAR_HR_MEASUREMENT = "00002a37-0000-1000-8000-00805f9b34fb"
 UUID_CHAR_HR_CONTROL = "00002a39-0000-1000-8000-00805f9b34fb"
+
+CHUNKED_ENDPOINT_AUTH = 0x82
 
 
 def encrypt_challenge(auth_key: bytes, challenge_bytes: bytes) -> bytes:
@@ -47,8 +53,54 @@ def parse_heart_rate(data: bytearray) -> int:
     return int.from_bytes(data[1:3], byteorder="little")
 
 
+async def write_chunked_value(
+    client: BleakClient,
+    char_uuid: str,
+    endpoint_type: int,
+    handle: int,
+    data: bytes
+) -> None:
+    """Split and transmit a payload using the Mi Band 6 Chunked Transfer Protocol."""
+    remaining = len(data)
+    count = 0
+    header_size = 11
+    mtu = 23
+
+    while remaining > 0:
+        max_chunk = mtu - 3 - header_size
+        copy_bytes = min(remaining, max_chunk)
+        chunk = bytearray(copy_bytes + header_size)
+        flags = 0
+
+        if count == 0:
+            flags |= 0x01
+            chunk[5] = len(data) & 0xFF
+            chunk[6] = (len(data) >> 8) & 0xFF
+            chunk[7] = (len(data) >> 16) & 0xFF
+            chunk[8] = (len(data) >> 24) & 0xFF
+            chunk[9] = endpoint_type & 0xFF
+            chunk[10] = (endpoint_type >> 8) & 0xFF
+
+        if remaining <= max_chunk:
+            flags |= 0x06  # End of transmission frame
+
+        chunk[0] = 0x03
+        chunk[1] = flags
+        chunk[2] = 0
+        chunk[3] = handle & 0xFF
+        chunk[4] = count & 0xFF
+
+        offset = len(data) - remaining
+        chunk[header_size:] = data[offset : offset + copy_bytes]
+
+        await client.write_gatt_char(char_uuid, bytes(chunk), response=False)
+        remaining -= copy_bytes
+        header_size = 5
+        count += 1
+
+
 class MiBand6Client:
-    """Handles BLE connection, Huami authentication handshake, and sensor streaming."""
+    """Handles BLE connection, Chunked Transfer ECDH authentication, and heart rate streaming."""
 
     def __init__(self, mac_address: str, auth_key_hex: str):
         self.mac_address = mac_address
@@ -65,51 +117,113 @@ class MiBand6Client:
         self._hr_callback: Optional[Callable[[int], None]] = None
         self._keepalive_task: Optional[asyncio.Task] = None
 
-    async def _on_auth_notification(self, _sender, data: bytearray) -> None:
-        """Handle auth characteristic notification packets."""
-        logger.debug("Auth notification received: %s", data.hex())
+        self._handle = 0
+        self._reassemble_buf = bytearray(512)
+        self._reassemble_ptr = 0
+        self._expected_bytes = 0
+        self._last_seq = 0
+        self._step2_sent = False
 
-        # Response to random challenge request (0x10, 0x02, 0x01)
-        if len(data) >= 19 and data[:3] == b"\x10\x02\x01":
-            random_challenge = bytes(data[3:19])
-            logger.info("Received challenge salt from band: %s", random_challenge.hex())
-            encrypted_salt = encrypt_challenge(self.auth_key, random_challenge)
-            auth_b = getattr(self, "_auth_byte", b"\x08")
-            response = b"\x03" + auth_b + encrypted_salt
-            logger.info("Sending encrypted challenge response to band...")
-            await self.client.write_gatt_char(UUID_CHAR_HUAMI_AUTH, response, response=False)
+        # Generate NIST B-163 ECDH key pair
+        self._prv_key, self._pub_key = generate_ecdh_keys()
 
-        # Response to encrypted challenge response (0x10, 0x03, status)
-        elif len(data) >= 3 and data[:2] == b"\x10\x03":
-            status = data[2]
-            if status == 0x01:
-                logger.info("Handshake verified! Device successfully authenticated.")
-                self._auth_event.set()
-            elif status == 0x04:
-                self._auth_error = "Invalid Auth Key (rejected by device)."
-                logger.error("Authentication failed: %s", self._auth_error)
-                self._auth_event.set()
-            else:
-                self._auth_error = f"Authentication returned unknown status: {hex(status)}"
-                logger.warning("Auth response status: %s", self._auth_error)
-                self._auth_event.set()
+    def _on_chunked_notification(self, _sender, data: bytearray) -> None:
+        """Process incoming chunked transfer packets from the band."""
+        if len(data) > 1 and data[0] == 0x03:
+            seq = data[4]
+            if (
+                seq == 0
+                and len(data) >= 14
+                and data[9] == CHUNKED_ENDPOINT_AUTH
+                and data[10] == 0x00
+                and data[11] == 0x10
+            ):
+                step = data[12]
+                status = data[13]
+
+                if step == 0x04 and status == 0x01:
+                    logger.info("Chunked Auth Step 1 acknowledged. Reassembling challenge & band public key...")
+                    self._reassemble_ptr = 0
+                    self._expected_bytes = data[5] - 3
+                    self._last_seq = 0
+                    header_size = 14
+                    payload = data[header_size:]
+                    self._reassemble_buf[self._reassemble_ptr : self._reassemble_ptr + len(payload)] = payload
+                    self._reassemble_ptr += len(payload)
+
+                elif step == 0x05 and status == 0x01:
+                    logger.info("Chunked Auth Step 2 acknowledged! Mi Band 6 authentication SUCCEEDED!")
+                    self._auth_event.set()
+                    return
+                else:
+                    self._auth_error = f"Auth step {hex(step)} returned status {hex(status)}"
+                    logger.warning("Auth failure: %s", self._auth_error)
+                    self._auth_event.set()
+                    return
+
+            elif seq > 0:
+                header_size = 5
+                payload = data[header_size:]
+                self._reassemble_buf[self._reassemble_ptr : self._reassemble_ptr + len(payload)] = payload
+                self._reassemble_ptr += len(payload)
+                self._last_seq = seq
+
+            if self._reassemble_ptr == self._expected_bytes and not self._step2_sent:
+                self._step2_sent = True
+                asyncio.create_task(self._complete_auth_step2())
+
+    async def _complete_auth_step2(self) -> None:
+        """Compute ECDH shared secret and send challenge response."""
+        remote_random = bytes(self._reassemble_buf[:16])
+        remote_public = bytes(self._reassemble_buf[16:64])
+        logger.info("Received random challenge salt (%s)", remote_random.hex())
+        logger.info("Received band ECDH public key (%s)", remote_public.hex())
+
+        # Compute ECDH shared secret (48 bytes)
+        shared_secret = compute_shared_secret(self._prv_key, remote_public)
+
+        # Derive final shared session AES key (16 bytes)
+        final_shared_session_aes = bytearray(16)
+        for i in range(16):
+            final_shared_session_aes[i] = shared_secret[i + 8] ^ self.auth_key[i]
+
+        # AES-CBC encrypt challenge with IV = 16 zeros
+        iv = b"\x00" * 16
+        cipher1 = Cipher(algorithms.AES(self.auth_key), modes.CBC(iv))
+        enc1 = cipher1.encryptor()
+        out1 = enc1.update(remote_random) + enc1.finalize()
+
+        cipher2 = Cipher(algorithms.AES(bytes(final_shared_session_aes)), modes.CBC(iv))
+        enc2 = cipher2.encryptor()
+        out2 = enc2.update(remote_random) + enc2.finalize()
+
+        command = b"\x05" + out1 + out2
+        logger.info("Sending Chunked Auth Step 2 response (33 bytes)...")
+        self._handle += 1
+        await write_chunked_value(
+            self.client,
+            UUID_CHAR_CHUNKED_WRITE,
+            CHUNKED_ENDPOINT_AUTH,
+            self._handle,
+            command,
+        )
 
     def _on_heart_rate_notification(self, _sender, data: bytearray) -> None:
         """Handle incoming heart rate measurement notifications."""
         try:
             bpm = parse_heart_rate(data)
-            logger.info("Current Heart Rate: %d BPM", bpm)
+            logger.info("❤️  Current Heart Rate: %d BPM", bpm)
             if self._hr_callback:
                 self._hr_callback(bpm)
         except Exception as exc:
             logger.error("Failed to parse heart rate measurement: %s", exc)
 
-    async def connect_and_authenticate(self, timeout_seconds: float = 25.0) -> None:
-        """Establish BLE connection and execute Huami authentication handshake."""
+    async def connect_and_authenticate(self, timeout_seconds: float = 30.0) -> None:
+        """Establish BLE connection and execute Chunked Transfer ECDH authentication."""
         logger.info("Scanning for Mi Band at %s...", self.mac_address)
         device = await BleakScanner.find_device_by_address(self.mac_address, timeout=10.0)
         if device is None:
-            logger.warning("Device not found during quick scan, attempting direct connect...")
+            logger.warning("Device not discovered during quick scan, attempting direct connect...")
             target = self.mac_address
         else:
             logger.info("Device discovered! RSSI: %s dBm", getattr(device, "rssi", "N/A"))
@@ -117,28 +231,30 @@ class MiBand6Client:
 
         self.client = BleakClient(target)
         await self.client.connect()
-        logger.info("BLE link established. Initializing auth service listener...")
+        logger.info("BLE link established. Initializing chunked transfer listener...")
 
-        await self.client.start_notify(UUID_CHAR_HUAMI_AUTH, self._on_auth_notification)
+        await self.client.start_notify(UUID_CHAR_CHUNKED_READ, self._on_chunked_notification)
 
-        # Trigger random challenge request (try 0x02, 0x08)
         self._auth_event.clear()
         self._auth_error = None
-        self._auth_byte = b"\x08"
-        logger.info("Requesting random auth challenge from band [0x02, 0x08]...")
-        await self.client.write_gatt_char(UUID_CHAR_HUAMI_AUTH, b"\x02\x08", response=False)
+        self._step2_sent = False
+
+        # Auth Step 1: Send client public key
+        initial_auth = b"\x04\x02\x00\x02" + self._pub_key
+        logger.info("Initiating Chunked ECDH handshake (sending client public key)...")
+        self._handle = 0
+        await write_chunked_value(
+            self.client,
+            UUID_CHAR_CHUNKED_WRITE,
+            CHUNKED_ENDPOINT_AUTH,
+            self._handle,
+            initial_auth,
+        )
 
         try:
             await asyncio.wait_for(self._auth_event.wait(), timeout=timeout_seconds)
         except asyncio.TimeoutError:
-            # Fallback retry with 0x02, 0x00 if band uses alternative auth byte
-            logger.warning("No response for [0x02, 0x08], retrying with [0x02, 0x00]...")
-            self._auth_byte = b"\x00"
-            await self.client.write_gatt_char(UUID_CHAR_HUAMI_AUTH, b"\x02\x00", response=False)
-            try:
-                await asyncio.wait_for(self._auth_event.wait(), timeout=10.0)
-            except asyncio.TimeoutError:
-                raise TimeoutError("Authentication timed out waiting for device challenge response.")
+            raise TimeoutError("Authentication timed out waiting for band ECDH response.")
 
         if self._auth_error:
             raise RuntimeError(f"Authentication failed: {self._auth_error}")
@@ -146,24 +262,29 @@ class MiBand6Client:
     async def start_heart_rate_stream(self, callback: Optional[Callable[[int], None]] = None) -> None:
         """Subscribe to real-time heart rate notifications and start sensor keep-alive."""
         self._hr_callback = callback
-        logger.info("Subscribing to heart rate measurement notifications...")
+        logger.info("Initializing heart rate sensor...")
+
+        # Reset measurement state
+        await self.client.write_gatt_char(UUID_CHAR_HR_CONTROL, b"\x15\x02\x00", response=False)
+        await self.client.write_gatt_char(UUID_CHAR_HR_CONTROL, b"\x15\x01\x00", response=False)
+
         await self.client.start_notify(UUID_CHAR_HR_MEASUREMENT, self._on_heart_rate_notification)
 
-        # Send activation command to Heart Rate Control Point
-        logger.info("Sending sensor continuous mode command [0x15, 0x01, 0x01]...")
-        await self.client.write_gatt_char(UUID_CHAR_HR_CONTROL, b"\x15\x01\x01", response=True)
+        # Start continuous measurement
+        logger.info("Starting continuous heart rate measurement [0x15, 0x01, 0x01]...")
+        await self.client.write_gatt_char(UUID_CHAR_HR_CONTROL, b"\x15\x01\x01", response=False)
 
         async def _keepalive_loop():
             try:
                 while True:
                     await asyncio.sleep(12)
-                    logger.debug("Sending sensor keep-alive ping [0x16]...")
-                    await self.client.write_gatt_char(UUID_CHAR_HR_CONTROL, b"\x16", response=True)
+                    logger.debug("Pinging heart rate monitor keep-alive [0x16]...")
+                    await self.client.write_gatt_char(UUID_CHAR_HR_CONTROL, b"\x16", response=False)
             except asyncio.CancelledError:
                 pass
 
         self._keepalive_task = asyncio.create_task(_keepalive_loop())
-        logger.info("Continuous heart rate monitoring started successfully.")
+        logger.info("Continuous heart rate monitoring active! Streaming real-time data...")
 
     async def stop_heart_rate_stream(self) -> None:
         """Stop sensor stream and cancel keep-alive loop."""
@@ -201,7 +322,7 @@ async def main() -> None:
     try:
         await client.connect_and_authenticate()
         await client.start_heart_rate_stream()
-        logger.info("Streaming active. Press Ctrl+C to exit.")
+        logger.info("Heart rate streaming active. Press Ctrl+C to exit.")
         while True:
             await asyncio.sleep(1)
     except (KeyboardInterrupt, asyncio.CancelledError):
@@ -212,4 +333,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
