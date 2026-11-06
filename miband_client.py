@@ -9,6 +9,8 @@ from typing import Callable, Optional
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from dotenv import load_dotenv
 from bleak import BleakClient, BleakScanner
+from bleak.backends.device import BLEDevice
+from bleak.backends.scanner import AdvertisementData
 from ecdh_wrapper import generate_ecdh_keys, compute_shared_secret
 
 # Configure logging
@@ -338,21 +340,44 @@ class MiBand6Client:
 
     async def connect_and_authenticate(self, timeout_seconds: float = 30.0) -> None:
         """Establish BLE connection and execute Chunked Transfer ECDH authentication."""
-        logger.info("Waiting for Mi Band broadcast at %s (please touch/light up band screen)...", self.mac_address)
-        device = None
-        for attempt in range(8):
-            device = await BleakScanner.find_device_by_address(self.mac_address, timeout=5.0)
-            if device:
-                break
-            logger.info("Searching for band... (%d/8, tap band screen to wake up)", attempt + 1)
+        logger.info("Waiting for Mi Band broadcast at %s (please swipe/light up band screen)...", self.mac_address)
+        found_device: Optional[BLEDevice] = None
+        stop_event = asyncio.Event()
 
-        if device is None:
+        def _on_detection(device: BLEDevice, _adv: AdvertisementData) -> None:
+            nonlocal found_device
+            if device.address.upper() == self.mac_address.upper():
+                found_device = device
+                stop_event.set()
+
+        scanner = BleakScanner(detection_callback=_on_detection)
+        await scanner.start()
+
+        async def _heartbeat() -> None:
+            elapsed = 0
+            while not stop_event.is_set():
+                await asyncio.sleep(5.0)
+                elapsed += 5
+                if not stop_event.is_set():
+                    logger.info("Scanning for band... (%ds elapsed, tap and keep sliding screen)", elapsed)
+
+        heartbeat_task = asyncio.create_task(_heartbeat())
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=90.0)
+        except asyncio.TimeoutError:
             raise TimeoutError(
-                f"Could not discover band {self.mac_address}. Please ensure the band screen is lit up and phone Bluetooth is off."
+                f"Could not discover band {self.mac_address} within 90s. "
+                "Please verify: 1) Phone Bluetooth is OFF / Airplane mode. 2) Band screen is touched and lit."
             )
+        finally:
+            heartbeat_task.cancel()
+            await scanner.stop()
 
-        logger.info("Band detected! RSSI: %s dBm. Establishing BLE link (keep screen awake)...", getattr(device, "rssi", "N/A"))
-        self.client = BleakClient(device, timeout=25.0)
+        logger.info(
+            "Band detected! RSSI: %s dBm. Establishing BLE link (KEEP SCREEN AWAKE by continuously swiping)...",
+            getattr(found_device, "rssi", "N/A"),
+        )
+        self.client = BleakClient(found_device, timeout=25.0)
         await self.client.connect()
 
         logger.info("BLE link established. Initializing chunked transfer listener...")
