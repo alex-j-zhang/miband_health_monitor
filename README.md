@@ -449,3 +449,20 @@ python export_csv.py --db data/mi_band.db --output data/csv
 - Chunked ECDH 与历史 fetch 协议参考 Gadgetbridge 项目（AGPL-3.0）的公开逆向成果，
   本项目为独立 Python 实现，未复制其源代码。
 - 本项目仅用于个人健康数据的自主采集与分析，请遵守手环使用条款与当地隐私法规。
+
+### 隐私与数据保护
+
+本项目会产生并落盘大量个人数据，仓库只应保存代码与脱敏文档：
+
+| 内容 | 位置 | 敏感信息 | git 状态 |
+|---|---|---|---|
+| 设备 MAC / auth_key | `.env` | 是（配对凭据） | 已忽略，权限 0600 |
+| 实时/历史健康数据 | `data/*.jsonl`、`data/mi_band.db`、`data/csv/` | 是（个人健康数据） | 已忽略 |
+| 真机验证材料 | `validation/`（run.log、payloads、btmon） | 是（MAC / 数据 / 空口包） | 已忽略 |
+| 调试日志与抓包 | `*.log`、`*.btsnoop`、`*.pcap` | 是 | 已忽略 |
+| 代码与文档 | 仓库根、`docs/` | 否（示例均为占位符） | 跟踪 |
+
+- 代码与文档中的 MAC 一律使用占位符（如 `C0:FF:EE:C0:FF:EE`），不要写入真实设备地址。
+- 对外反馈问题前，按 [`docs/history_hardware_validation.md`](docs/history_hardware_validation.md) §9
+  对日志做 MAC 脱敏，并确认其中不含 `auth_key`。
+- 提交前可自查：`git status --ignored`、`git ls-files -ci --exclude-standard`。
