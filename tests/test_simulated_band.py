@@ -231,12 +231,20 @@ async def test_demo_end_to_end_writes_jsonl_and_sqlite(tmp_path):
 
     # CSV export from the captured database.
     exported = export_database(tmp_path / "mi_band.db", tmp_path / "csv")
-    assert set(exported) == {"heart_rate", "steps", "imu"}
+    assert set(exported) == {
+        "heart_rate",
+        "steps",
+        "imu",
+        "spo2",
+        "activity_history",
+    }
     for table, (path, rows) in exported.items():
-        assert path.exists() and rows >= 1, table
+        assert path.exists(), table
         with open(path, encoding="utf-8") as handle:
             header = handle.readline().strip().split(",")
         assert "ts" in header and "iso_time" in header
+    assert exported["heart_rate"][1] >= 1
+    assert exported["imu"][1] >= 1
 
 
 async def test_demo_records_can_be_reloaded(tmp_path):

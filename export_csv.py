@@ -35,6 +35,20 @@ TABLE_COLUMNS = {
         "ay_ms2",
         "az_ms2",
     ],
+    "spo2": ["id", "ts", "iso_time", "spo2", "auto_measure"],
+    "activity_history": [
+        "id",
+        "ts",
+        "iso_time",
+        "kind",
+        "intensity",
+        "steps",
+        "heart_rate",
+        "unknown1",
+        "sleep",
+        "deep_sleep",
+        "rem_sleep",
+    ],
 }
 
 DEFAULT_DB = Path("data") / "mi_band.db"

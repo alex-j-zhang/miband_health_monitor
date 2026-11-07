@@ -44,9 +44,10 @@ from dotenv import load_dotenv
 
 from bleak import BleakClient, BleakScanner
 
+from band_history import sync_history, summarize_history_result
+from dashboard import DashboardServer, TelemetryHub
 from ecdh_wrapper import compute_shared_secret, generate_ecdh_keys
 from export_csv import export_database
-from dashboard import DashboardServer, TelemetryHub
 from storage import STORAGE_BACKENDS, TelemetryStore
 
 logger = logging.getLogger("MiBand6Client")
@@ -278,11 +279,13 @@ async def write_chunked_value(
 # --------------------------------------------------------------------------
 @dataclass
 class StreamCallbacks:
-    """Optional consumers for the three telemetry streams."""
+    """Optional consumers for the telemetry and band-history data streams."""
 
     heart_rate: Optional[Callable[[int], None]] = None
     steps: Optional[Callable[[dict], None]] = None
     imu: Optional[Callable[[dict], None]] = None
+    history_spo2: Optional[Callable[[dict], None]] = None
+    history_activity: Optional[Callable[[dict], None]] = None
 
 
 class MiBand6Client:
@@ -781,6 +784,28 @@ class MiBand6Client:
 # --------------------------------------------------------------------------
 # Session supervisor
 # --------------------------------------------------------------------------
+async def _sync_band_history(
+    client: MiBand6Client,
+    days: int,
+    callbacks: StreamCallbacks,
+) -> None:
+    """Fetch band-side history once; failures never abort live streaming."""
+    logger.info("Fetching up to %d day(s) of band-side history (experimental)...", days)
+    try:
+        result = await sync_history(
+            client,
+            days=days,
+            on_spo2=callbacks.history_spo2,
+            on_activity=callbacks.history_activity,
+        )
+    except Exception as exc:
+        logger.error("Band history sync failed (continuing with live streams): %s", exc)
+        return
+    logger.info("Band history sync finished: %s", summarize_history_result(result))
+    for error in result.errors:
+        logger.warning("History sync issue: %s", error)
+
+
 async def run_monitor(
     mac_address: str,
     auth_key_hex: str,
@@ -792,6 +817,7 @@ async def run_monitor(
     reconnect: bool = True,
     reconnect_initial_delay: float = 1.0,
     reconnect_max_delay: float = 30.0,
+    sync_history_days: Optional[int] = None,
     client_factory: Optional[Callable[[str, str], MiBand6Client]] = None,
 ) -> None:
     """Connect + stream until *duration* elapses, reconnecting with backoff."""
@@ -813,6 +839,8 @@ async def run_monitor(
         failure: Optional[BaseException] = None
         try:
             await client.connect_and_authenticate(scan_timeout=scan_timeout)
+            if sync_history_days is not None:
+                await _sync_band_history(client, sync_history_days, callbacks)
             await client.start_heart_rate_stream(callbacks.heart_rate)
             await client.start_steps_stream(callbacks.steps)
             if imu:
@@ -870,6 +898,7 @@ async def run_demo(
     duration: Optional[int] = None,
     imu: bool = False,
     callbacks: Optional[StreamCallbacks] = None,
+    sync_history_days: Optional[int] = None,
 ) -> None:
     """Run the full client stack against the in-memory simulator (no hardware)."""
     from sim_band import FakeBleakScanner, SimulatedBand, simulated_factories
@@ -899,6 +928,7 @@ async def run_demo(
         reconnect=True,
         reconnect_initial_delay=0.2,
         reconnect_max_delay=1.0,
+        sync_history_days=sync_history_days,
         client_factory=_factory,
     )
 
@@ -947,6 +977,18 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="collection duration in seconds (default: until Ctrl+C)",
     )
     parser.add_argument("--imu", action="store_true", help="also stream raw IMU accelerometer data")
+    parser.add_argument(
+        "--sync-history",
+        nargs="?",
+        const=7,
+        type=int,
+        default=_env_optional_int("HISTORY_DAYS"),
+        metavar="DAYS",
+        help=(
+            "fetch up to DAYS days of band-side history (activity + SpO2) after "
+            "connecting, experimental (default: off, or HISTORY_DAYS env)"
+        ),
+    )
     parser.add_argument(
         "--demo",
         action="store_true",
@@ -1068,10 +1110,28 @@ async def main(argv: Optional[list[str]] = None) -> int:
         if hub is not None:
             hub.publish_imu(info)
 
+    def _on_history_spo2(sample: dict) -> None:
+        store.record_spo2(
+            sample["spo2"],
+            auto_measure=bool(sample.get("auto_measure")),
+            timestamp=sample.get("ts"),
+        )
+        if hub is not None:
+            hub.publish_spo2(
+                sample["spo2"],
+                status=1 if sample.get("auto_measure") else 0,
+                timestamp=sample.get("ts"),
+            )
+
+    def _on_history_activity(sample: dict) -> None:
+        store.record_activity_history(sample, timestamp=sample.get("ts"))
+
     callbacks = StreamCallbacks(
         heart_rate=_on_heart_rate,
         steps=_on_steps,
         imu=_on_imu,
+        history_spo2=_on_history_spo2,
+        history_activity=_on_history_activity,
     )
     if args.storage == "none":
         logger.info("Storage disabled; telemetry will only be logged.")
@@ -1091,6 +1151,7 @@ async def main(argv: Optional[list[str]] = None) -> int:
                 duration=args.duration,
                 imu=args.imu,
                 callbacks=callbacks,
+                sync_history_days=args.sync_history,
             )
         else:
             await run_monitor(
@@ -1101,6 +1162,7 @@ async def main(argv: Optional[list[str]] = None) -> int:
                 callbacks=callbacks,
                 scan_timeout=args.scan_timeout,
                 reconnect=not args.no_reconnect,
+                sync_history_days=args.sync_history,
             )
     except KeyboardInterrupt:
         logger.info("Stopping on user request...")

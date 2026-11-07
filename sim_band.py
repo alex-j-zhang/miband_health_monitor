@@ -22,10 +22,25 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import struct
+import time
+from datetime import datetime
 from typing import Callable, Optional
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
+from band_history import (
+    COMMAND_ACK,
+    COMMAND_FETCH_DATA,
+    COMMAND_START_DATE,
+    RESPONSE,
+    SUCCESS,
+    UUID_CHAR_ACTIVITY_DATA,
+    UUID_CHAR_FETCH,
+    FetchDataType,
+    decode_fetch_time,
+    encode_fetch_time,
+)
 from ecdh_wrapper import compute_shared_secret, generate_ecdh_keys
 from miband_client import (
     CHUNKED_ENDPOINT_AUTH,
@@ -84,6 +99,9 @@ class SimulatedBand:
         fail_auth_connections: int = 0,
         drop_auth_seqs: tuple[int, ...] = (),
         disconnect_after: Optional[float] = None,
+        history_spo2: Optional[list[dict]] = None,
+        history_activity: Optional[list[dict]] = None,
+        drop_history_packets: tuple[int, ...] = (),
     ) -> None:
         if len(auth_key) != 16:
             raise ValueError("auth_key must be 16 bytes")
@@ -110,6 +128,28 @@ class SimulatedBand:
             ]
         )
 
+        now = time.time()
+        self.history_spo2 = (
+            list(history_spo2)
+            if history_spo2 is not None
+            else [
+                {"ts": now - 600, "spo2": 97, "auto_measure": False},
+                {"ts": now - 300, "spo2": 96, "auto_measure": True},
+                {"ts": now - 60, "spo2": 98, "auto_measure": False},
+            ]
+        )
+        self.history_activity = (
+            list(history_activity)
+            if history_activity is not None
+            else [
+                _activity_sample(now - 240, steps=12, heart_rate=70),
+                _activity_sample(now - 180, steps=30, heart_rate=74),
+                _activity_sample(now - 120, steps=8, heart_rate=72),
+                _activity_sample(now - 60, steps=21, heart_rate=76),
+            ]
+        )
+        self.drop_history_packets = set(drop_history_packets)
+
         self.fail_auth = fail_auth
         self._remaining_auth_failures = max(0, int(fail_auth_connections))
         self._fail_this_auth = fail_auth
@@ -129,6 +169,8 @@ class SimulatedBand:
         self._sensor_started = False
         self._steps_scheduled = False
         self._imu_scheduled = False
+        self._fetch_payload = b""
+        self._fetch_data_sent = False
 
     # ------------------------------------------------------- connection life
     def on_connect(self, client: "FakeBleakClient") -> None:
@@ -162,6 +204,8 @@ class SimulatedBand:
         self._sensor_started = False
         self._steps_scheduled = False
         self._imu_scheduled = False
+        self._fetch_payload = b""
+        self._fetch_data_sent = False
 
     def _cancel_timers(self) -> None:
         for timer in self._timers:
@@ -188,6 +232,8 @@ class SimulatedBand:
             self._on_heart_rate_control(data)
         elif uuid == UUID_CHAR_RAW_SENSOR_CONTROL:
             self._on_sensor_control(data)
+        elif uuid == UUID_CHAR_FETCH:
+            self._on_fetch_write(data)
 
     def read(self, uuid: str) -> bytes:
         if uuid == UUID_CHAR_STEPS and self.steps_packets:
@@ -214,6 +260,116 @@ class SimulatedBand:
             self._sensor_started = False
         elif data and data[0] in (0x01, 0x02):
             self._sensor_started = True
+
+    # ------------------------------------------------ historical data fetch
+    def _on_fetch_write(self, data: bytes) -> None:
+        if not data:
+            return
+        command = data[0]
+        if command == COMMAND_START_DATE:
+            if len(data) < 2:
+                self._emit_later(
+                    UUID_CHAR_FETCH, bytes([RESPONSE, COMMAND_START_DATE, 0x02]), 0.001
+                )
+                return
+            data_type = data[1]
+            try:
+                since = decode_fetch_time(data[2:])
+            except Exception:
+                since = datetime.now()
+            payload, start_timestamp = self._build_history_payload(data_type, since)
+            if payload is None:  # unsupported data type
+                self._emit_later(
+                    UUID_CHAR_FETCH, bytes([RESPONSE, COMMAND_START_DATE, 0x02]), 0.001
+                )
+                return
+            self._fetch_payload = payload
+            metadata = (
+                bytes([RESPONSE, COMMAND_START_DATE, SUCCESS])
+                + len(payload).to_bytes(4, "little")
+                + encode_fetch_time(datetime.fromtimestamp(start_timestamp))
+            )
+            self._emit_later(UUID_CHAR_FETCH, metadata, 0.001)
+            return
+
+        if command == COMMAND_FETCH_DATA:
+            payload = self._fetch_payload
+            if not payload:
+                self._emit_later(
+                    UUID_CHAR_FETCH, bytes([RESPONSE, COMMAND_FETCH_DATA, 0x02]), 0.001
+                )
+                return
+            chunks = [payload[offset : offset + 19] for offset in range(0, len(payload), 19)]
+            for index, chunk in enumerate(chunks):
+                if index in self.drop_history_packets:
+                    logger.warning("Simulated band: dropping history packet %d", index)
+                    continue
+                packet = bytes([index & 0xFF]) + chunk
+                self._emit_later(UUID_CHAR_ACTIVITY_DATA, packet, 0.002 * (index + 1))
+            self._emit_later(
+                UUID_CHAR_FETCH,
+                bytes([RESPONSE, COMMAND_FETCH_DATA, SUCCESS]),
+                0.002 * (len(chunks) + 1),
+            )
+            self._fetch_data_sent = True
+            return
+
+        if command == COMMAND_ACK:
+            self._emit_later(UUID_CHAR_FETCH, bytes([RESPONSE, COMMAND_ACK]), 0.001)
+            self._fetch_payload = b""
+            self._fetch_data_sent = False
+
+    def _build_history_payload(
+        self, data_type: int, since: datetime
+    ) -> tuple[Optional[bytes], float]:
+        """Build the payload a real band would return for *data_type* since *since*."""
+        since_ts = since.timestamp()
+        try:
+            fetch_type = FetchDataType(data_type)
+        except ValueError:
+            return None, since_ts
+
+        if fetch_type == FetchDataType.SPO2_NORMAL:
+            samples = [s for s in self.history_spo2 if float(s["ts"]) >= since_ts]
+            if not samples:
+                return b"", since_ts
+            payload = bytearray([0x02])  # payload version
+            for sample in sorted(samples, key=lambda s: s["ts"]):
+                spo2 = int(sample["spo2"])
+                if sample.get("auto_measure"):
+                    raw = spo2 - 128
+                else:
+                    raw = spo2
+                payload += struct.pack("<i", int(sample["ts"]))
+                payload += struct.pack("<b", raw)
+                payload += b"\x00" * 60
+            return bytes(payload), float(min(s["ts"] for s in samples))
+
+        if fetch_type == FetchDataType.ACTIVITY:
+            samples = [s for s in self.history_activity if float(s["ts"]) >= since_ts]
+            if not samples:
+                return b"", since_ts
+            payload = bytearray()
+            for sample in sorted(samples, key=lambda s: s["ts"]):
+                payload += struct.pack(
+                    "<BBBBBBBB",
+                    int(sample.get("kind", 0)),
+                    int(sample.get("intensity", 0)),
+                    int(sample.get("steps", 0)),
+                    int(sample.get("heart_rate", 0)),
+                    int(sample.get("unknown1", 0)),
+                    int(sample.get("sleep", 0)),
+                    int(sample.get("deep_sleep", 0)),
+                    int(sample.get("rem_sleep", 0)),
+                )
+            return bytes(payload), float(min(s["ts"] for s in samples))
+
+        return None, since_ts
+
+    def _emit_later(self, uuid: str, payload: bytes, delay: float) -> None:
+        self._timers.append(
+            self._loop.call_later(delay, self._emit, uuid, payload)  # type: ignore[union-attr]
+        )
 
     # ------------------------------------------------------- chunked framing
     def _consume_chunk(self, chunk: bytes) -> None:
@@ -513,6 +669,32 @@ def _steps_packet(steps: int, distance_m: int, calories: int) -> bytes:
         + distance_m.to_bytes(4, "little")
         + calories.to_bytes(4, "little")
     )
+
+
+def _activity_sample(
+    timestamp: float,
+    *,
+    kind: int = 1,
+    intensity: int = 10,
+    steps: int = 0,
+    heart_rate: int = 0,
+    unknown1: int = 0,
+    sleep: int = 0,
+    deep_sleep: int = 0,
+    rem_sleep: int = 0,
+) -> dict:
+    """Build one per-minute historical activity sample for the simulator."""
+    return {
+        "ts": float(timestamp),
+        "kind": kind,
+        "intensity": intensity,
+        "steps": steps,
+        "heart_rate": heart_rate,
+        "unknown1": unknown1,
+        "sleep": sleep,
+        "deep_sleep": deep_sleep,
+        "rem_sleep": rem_sleep,
+    }
 
 
 def _imu_packet(sequence: int, samples: list[tuple[int, int, int]]) -> bytes:

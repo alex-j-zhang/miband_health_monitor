@@ -42,6 +42,8 @@ JSONL_FILENAMES = {
     "heart_rate": "heart_rate.jsonl",
     "steps": "steps.jsonl",
     "imu": "imu.jsonl",
+    "spo2": "spo2.jsonl",
+    "activity_history": "activity_history.jsonl",
 }
 
 DB_FILENAME = "mi_band.db"
@@ -84,6 +86,31 @@ CREATE TABLE IF NOT EXISTS imu (
 CREATE INDEX IF NOT EXISTS idx_heart_rate_ts ON heart_rate(ts);
 CREATE INDEX IF NOT EXISTS idx_steps_ts ON steps(ts);
 CREATE INDEX IF NOT EXISTS idx_imu_ts ON imu(ts);
+
+CREATE TABLE IF NOT EXISTS spo2 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    iso_time TEXT NOT NULL,
+    spo2 INTEGER NOT NULL,
+    auto_measure INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS activity_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    iso_time TEXT NOT NULL,
+    kind INTEGER NOT NULL,
+    intensity INTEGER NOT NULL,
+    steps INTEGER NOT NULL,
+    heart_rate INTEGER NOT NULL,
+    unknown1 INTEGER NOT NULL DEFAULT 0,
+    sleep INTEGER NOT NULL DEFAULT 0,
+    deep_sleep INTEGER NOT NULL DEFAULT 0,
+    rem_sleep INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_spo2_ts ON spo2(ts);
+CREATE INDEX IF NOT EXISTS idx_activity_history_ts ON activity_history(ts);
 """
 
 _INSERT_SQL = {
@@ -96,6 +123,14 @@ _INSERT_SQL = {
         "INSERT INTO imu (ts, iso_time, sensor_type, sequence, sample_index, "
         "x_raw, y_raw, z_raw, ax_g, ay_g, az_g, ax_ms2, ay_ms2, az_ms2) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ),
+    "spo2": (
+        "INSERT INTO spo2 (ts, iso_time, spo2, auto_measure) VALUES (?, ?, ?, ?)"
+    ),
+    "activity_history": (
+        "INSERT INTO activity_history (ts, iso_time, kind, intensity, steps, "
+        "heart_rate, unknown1, sleep, deep_sleep, rem_sleep) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ),
 }
 
@@ -136,7 +171,13 @@ class TelemetryStore:
         self._lock = threading.Lock()
         self._closed = False
         self._failed = False
-        self._counts = {"heart_rate": 0, "steps": 0, "imu": 0}
+        self._counts = {
+            "heart_rate": 0,
+            "steps": 0,
+            "imu": 0,
+            "spo2": 0,
+            "activity_history": 0,
+        }
         self._dropped = 0
         self._thread: Optional[threading.Thread] = None
 
@@ -186,6 +227,38 @@ class TelemetryStore:
                     "az_ms2": float(sample.get("az_ms2", 0.0)),
                 },
             )
+
+    def record_spo2(
+        self,
+        spo2: int,
+        auto_measure: bool = False,
+        timestamp: Optional[float] = None,
+    ) -> None:
+        """Persist one blood-oxygen sample (percent, 0-100)."""
+        self._enqueue(
+            "spo2",
+            timestamp,
+            {"spo2": int(spo2), "auto_measure": 1 if auto_measure else 0},
+        )
+
+    def record_activity_history(
+        self, sample: dict, timestamp: Optional[float] = None
+    ) -> None:
+        """Persist one per-minute historical activity sample fetched from the band."""
+        self._enqueue(
+            "activity_history",
+            timestamp,
+            {
+                "kind": int(sample.get("kind", 0)),
+                "intensity": int(sample.get("intensity", 0)),
+                "steps": int(sample.get("steps", 0)),
+                "heart_rate": int(sample.get("heart_rate", 0)),
+                "unknown1": int(sample.get("unknown1", 0)),
+                "sleep": int(sample.get("sleep", 0)),
+                "deep_sleep": int(sample.get("deep_sleep", 0)),
+                "rem_sleep": int(sample.get("rem_sleep", 0)),
+            },
+        )
 
     def stats(self) -> dict:
         """Return a snapshot of enqueue counters (useful for shutdown logs)."""
@@ -336,6 +409,27 @@ class TelemetryStore:
                     payload["ax_ms2"],
                     payload["ay_ms2"],
                     payload["az_ms2"],
+                ),
+            )
+        elif kind == "spo2":
+            conn.execute(
+                _INSERT_SQL[kind],
+                (event_ts, iso_time, payload["spo2"], payload["auto_measure"]),
+            )
+        elif kind == "activity_history":
+            conn.execute(
+                _INSERT_SQL[kind],
+                (
+                    event_ts,
+                    iso_time,
+                    payload["kind"],
+                    payload["intensity"],
+                    payload["steps"],
+                    payload["heart_rate"],
+                    payload["unknown1"],
+                    payload["sleep"],
+                    payload["deep_sleep"],
+                    payload["rem_sleep"],
                 ),
             )
         else:  # pragma: no cover - guarded by callers

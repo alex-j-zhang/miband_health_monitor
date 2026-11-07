@@ -140,14 +140,52 @@ def test_both_backends_contain_the_same_data(tmp_path):
     assert [row[0] for row in sqlite_rows] == [row["bpm"] for row in jsonl_rows]
 
 
+def test_spo2_and_activity_history_persist(tmp_path):
+    with TelemetryStore(tmp_path, backend="both") as store:
+        store.record_spo2(97, auto_measure=False, timestamp=1000.0)
+        store.record_spo2(95, auto_measure=True, timestamp=1060.0)
+        store.record_activity_history(
+            {
+                "kind": 1,
+                "intensity": 10,
+                "steps": 12,
+                "heart_rate": 70,
+                "sleep": 0,
+                "deep_sleep": 0,
+                "rem_sleep": 0,
+            },
+            timestamp=2000.0,
+        )
+
+    spo2_rows = read_jsonl(tmp_path / "spo2.jsonl")
+    assert [(row["spo2"], row["auto_measure"]) for row in spo2_rows] == [(97, 0), (95, 1)]
+    activity_rows = read_jsonl(tmp_path / "activity_history.jsonl")
+    assert activity_rows[0]["steps"] == 12
+    assert activity_rows[0]["heart_rate"] == 70
+
+    conn = sqlite3.connect(tmp_path / "mi_band.db")
+    try:
+        assert conn.execute("SELECT spo2 FROM spo2 ORDER BY ts").fetchall() == [(97,), (95,)]
+        assert conn.execute("SELECT steps, heart_rate FROM activity_history").fetchone() == (12, 70)
+    finally:
+        conn.close()
+
+
 def test_export_csv_roundtrip(tmp_path):
     with TelemetryStore(tmp_path, backend="sqlite") as store:
         _populate(store)
 
     exported = export_database(tmp_path / "mi_band.db", tmp_path / "csv")
-    assert set(exported) == {"heart_rate", "steps", "imu"}
+    assert set(exported) == {
+        "heart_rate",
+        "steps",
+        "imu",
+        "spo2",
+        "activity_history",
+    }
     assert exported["heart_rate"][1] == 2
     assert exported["imu"][1] == 2
+    assert exported["spo2"][1] == 0
 
     with open(tmp_path / "csv" / "heart_rate.csv", newline="", encoding="utf-8") as handle:
         rows = list(csv.reader(handle))
