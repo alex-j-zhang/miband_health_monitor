@@ -92,6 +92,8 @@ miband_health_monitor/
 ├── scan_live.py            # 排障：连续事件扫描（找 MAC）
 ├── test_miband.py          # 原有单元测试（加密/解析器）
 ├── tests/                  # 存储、chunked 协议、模拟手环、看板、历史数据测试
+├── tools/                  # 诊断工具：capture_history_payload.py（真机 payload 抓取）
+├── docs/                   # 文档：history_hardware_validation.md（⑦ 真机验证清单）
 ├── requirements.txt
 ├── pytest.ini
 ├── .env.example
@@ -369,6 +371,11 @@ python export_csv.py --db data/mi_band.db --output data/csv
 > `--log-level DEBUG` 抓日志；历史同步失败不会中断实时采集。
 > 协议参考：[Gadgetbridge](https://codeberg.org/Freeyourgadget/Gadgetbridge)
 > 的 `HuamiSupport` / `operations/fetch`（AGPL-3.0，仅作协议事实参考）。
+>
+> 📋 **真机验证**：请按 [docs/history_hardware_validation.md](docs/history_hardware_validation.md)
+> 的清单执行（含逐阶段期望日志、失败速查、未验证假设与反馈模板）。
+> 需要原始 payload 硬证据时运行：
+> `python tools/capture_history_payload.py --days 7 --output validation/payloads`。
 
 拉取到的数据会进入 `spo2.jsonl` / `activity_history.jsonl`、SQLite 的 `spo2` /
 `activity_history` 表、CSV 导出，并实时推送到看板的血氧卡片/曲线。
