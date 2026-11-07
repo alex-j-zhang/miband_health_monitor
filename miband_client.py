@@ -46,6 +46,7 @@ from bleak import BleakClient, BleakScanner
 
 from ecdh_wrapper import compute_shared_secret, generate_ecdh_keys
 from export_csv import export_database
+from dashboard import DashboardServer, TelemetryHub
 from storage import STORAGE_BACKENDS, TelemetryStore
 
 logger = logging.getLogger("MiBand6Client")
@@ -921,6 +922,18 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _env_optional_int(name: str) -> Optional[int]:
+    """Read an optional integer from the environment (``None`` when unset)."""
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r from environment", name, raw)
+        return None
+
+
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     load_dotenv()
     parser = argparse.ArgumentParser(
@@ -967,6 +980,17 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="DEBUG | INFO | WARNING | ERROR (default: INFO)",
     )
     parser.add_argument(
+        "--web-port",
+        type=int,
+        default=_env_optional_int("WEB_PORT"),
+        help="serve the live web dashboard on this port (0 = random free port; default: off)",
+    )
+    parser.add_argument(
+        "--web-host",
+        default=os.getenv("WEB_HOST", "127.0.0.1"),
+        help="dashboard bind address (default: 127.0.0.1)",
+    )
+    parser.add_argument(
         "--no-reconnect",
         action="store_true",
         help="do not automatically reconnect after errors or link loss",
@@ -1009,10 +1033,45 @@ async def main(argv: Optional[list[str]] = None) -> int:
             return 1
 
     store = TelemetryStore(args.output, backend=args.storage)
+
+    hub: Optional[TelemetryHub] = None
+    web_server: Optional[DashboardServer] = None
+    if args.web_port is not None:
+        hub = TelemetryHub()
+        hub.attach_loop(asyncio.get_running_loop())
+        web_server = DashboardServer(hub, host=args.web_host, port=args.web_port)
+        try:
+            await web_server.start()
+            logger.info("Live dashboard: %s", web_server.url)
+        except OSError as exc:
+            logger.error(
+                "Could not start the dashboard on %s:%s: %s",
+                args.web_host,
+                args.web_port,
+                exc,
+            )
+            web_server = None
+            hub = None
+
+    def _on_heart_rate(bpm: int) -> None:
+        store.record_heart_rate(bpm)
+        if hub is not None:
+            hub.publish_heart_rate(bpm)
+
+    def _on_steps(info: dict) -> None:
+        store.record_steps(info)
+        if hub is not None:
+            hub.publish_steps(info)
+
+    def _on_imu(info: dict) -> None:
+        store.record_imu(info)
+        if hub is not None:
+            hub.publish_imu(info)
+
     callbacks = StreamCallbacks(
-        heart_rate=store.record_heart_rate,
-        steps=store.record_steps,
-        imu=store.record_imu,
+        heart_rate=_on_heart_rate,
+        steps=_on_steps,
+        imu=_on_imu,
     )
     if args.storage == "none":
         logger.info("Storage disabled; telemetry will only be logged.")
@@ -1049,6 +1108,11 @@ async def main(argv: Optional[list[str]] = None) -> int:
         logger.error("Monitoring stopped after error: %s", exc)
         exit_code = 1
     finally:
+        if web_server is not None:
+            try:
+                await web_server.stop()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("Error while stopping the dashboard: %s", exc)
         store.close()
         logger.info("Storage summary: %s", store.stats())
         if args.export_csv:
