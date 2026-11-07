@@ -258,6 +258,7 @@ class BandHistoryFetcher:
             logger.warning("No ack response received from band (continuing)")
             return
         if len(response) >= 2 and response[0] == RESPONSE and response[1] == COMMAND_ACK:
+            logger.debug("Ack response: %s", response.hex())
             if len(response) >= 3 and response[2] != SUCCESS:
                 raise HistoryFetchError(
                     f"band rejected activity-data ack (status 0x{response[2]:02x})"
@@ -282,6 +283,7 @@ class BandHistoryFetcher:
             await self._write(start_command)
 
             metadata = await self._next(self._fetch_queue, "start-date response")
+            logger.debug("Start-date response: %s", metadata.hex())
             if len(metadata) < 3 or metadata[0] != RESPONSE or metadata[1] != COMMAND_START_DATE:
                 raise HistoryFetchError(f"unexpected start-date response: {metadata.hex()}")
             if metadata[2] != SUCCESS:
@@ -320,10 +322,12 @@ class BandHistoryFetcher:
                     raise HistoryFetchError(
                         f"packet counter mismatch: got {counter}, expected {expected_counter}"
                     )
+                logger.debug("History chunk seq=%d (%d bytes)", counter, len(packet))
                 last_counter = counter
                 buffer.extend(packet[1:])
 
             completion = await self._next(self._fetch_queue, "fetch completion")
+            logger.debug("Fetch completion response: %s", completion.hex())
             if (
                 len(completion) < 3
                 or completion[0] != RESPONSE
@@ -346,6 +350,11 @@ class BandHistoryFetcher:
                     )
 
             await self._send_ack()
+            logger.debug(
+                "Fetched payload OK: %d bytes, crc=%s",
+                len(payload),
+                "verified" if len(completion) >= 7 else "absent",
+            )
             return payload, start_timestamp
         finally:
             await self._close()
