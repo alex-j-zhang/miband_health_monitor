@@ -1,5 +1,13 @@
+# Mi Band 6 BLE client runtime
 bleak>=3.0.0
 cryptography>=40.0.0
 python-dotenv>=1.0.0
-pytest>=8.0.0
 
+# Auth-key extraction helpers (huami_token / get_auth_key.py / fetch_by_token.py)
+loguru>=0.7.0
+pycryptodome>=3.19.0
+requests>=2.31.0
+
+# Test tooling
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
