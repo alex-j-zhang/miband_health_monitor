@@ -46,6 +46,7 @@ from bleak import BleakClient, BleakScanner
 
 from band_history import sync_history, summarize_history_result
 from dashboard import DashboardServer, TelemetryHub
+from ecdh_wrapper import backend_name as ecdh_backend_name
 from ecdh_wrapper import compute_shared_secret, generate_ecdh_keys
 from export_csv import export_database
 from storage import STORAGE_BACKENDS, TelemetryStore
@@ -205,6 +206,76 @@ def normalize_auth_key(auth_key_hex: str) -> bytes:
         raise ValueError(f"Auth key is not valid hexadecimal: {exc}") from exc
 
 
+# --------------------------------------------------------------------------
+# Device identity helpers (cross-platform)
+# --------------------------------------------------------------------------
+#: Values that mean "not configured yet" in a fresh ``.env``.
+PLACEHOLDER_DEVICE_PREFIXES = ("XX:", "XX-", "XX_")
+
+
+def is_placeholder_device_id(device_id: Optional[str]) -> bool:
+    """Return True for empty or template values such as ``XX:XX:...``."""
+    value = (device_id or "").strip()
+    if not value:
+        return True
+    return value.upper().startswith(PLACEHOLDER_DEVICE_PREFIXES)
+
+
+def normalize_device_identifier(value: str) -> str:
+    """Normalise a Bluetooth address / CoreBluetooth UUID for comparison.
+
+    Handles ``AA:BB:CC:DD:EE:FF``, ``AA-BB-...``, lowercase input and the
+    ``{UUID}`` form some tools print for macOS device identifiers.
+    """
+    return "".join(ch for ch in (value or "").upper() if ch.isalnum())
+
+
+def device_matches(
+    device_id: Optional[str],
+    device_name: Optional[str],
+    device: object,
+    advertisement: Optional[object] = None,
+) -> bool:
+    """Return True when *device* matches the configured identifier or name.
+
+    ``device_id`` is compared against ``device.address``; on Linux/Windows this
+    is the Bluetooth MAC address, while on macOS CoreBluetooth exposes a
+    per-host UUID there.  ``device_name`` (a case-insensitive substring) is an
+    optional extra match that works on every platform, which makes it possible
+    to pair the client with a band even when the address is unavailable.
+    """
+    wanted = normalize_device_identifier(device_id or "")
+    if wanted:
+        address = normalize_device_identifier(str(getattr(device, "address", "") or ""))
+        if address and address == wanted:
+            return True
+
+    wanted_name = (device_name or "").strip().lower()
+    if wanted_name:
+        names = [
+            getattr(device, "name", None),
+            getattr(advertisement, "local_name", None),
+        ]
+        for candidate in names:
+            if candidate and wanted_name in str(candidate).lower():
+                return True
+    return False
+
+
+def _env_device_id() -> str:
+    """Read the configured device identifier from the environment.
+
+    ``DEVICE_ID`` is the cross-platform name (MAC address or macOS UUID);
+    ``DEVICE_MAC`` is still accepted for backwards compatibility.  Placeholder
+    template values are ignored so a legacy real value wins over the template.
+    """
+    values = [(os.getenv("DEVICE_ID") or "").strip(), (os.getenv("DEVICE_MAC") or "").strip()]
+    for value in values:
+        if value and not is_placeholder_device_id(value):
+            return value
+    return values[0] or values[1]
+
+
 def _resolve_mtu(client: object, mtu: Optional[int] = None) -> int:
     """Best-effort MTU discovery with a conservative floor of 23 bytes."""
     candidate: object = mtu
@@ -293,22 +364,30 @@ class MiBand6Client:
 
     def __init__(
         self,
-        mac_address: str,
+        device_id: str,
         auth_key_hex: str,
         *,
+        device_name: Optional[str] = None,
+        mtu: Optional[int] = None,
         client_factory: Optional[Callable] = None,
         scanner_factory: Optional[Callable] = None,
         scan_timeout: float = 90.0,
         connect_timeout: float = 25.0,
         auth_timeout: float = 30.0,
     ) -> None:
-        self.mac_address = mac_address.strip()
+        self.device_id = (device_id or "").strip()
+        # Optional case-insensitive advertised-name match; works on platforms
+        # (macOS) where the Bluetooth address is not exposed to applications.
+        self.device_name = (device_name or "").strip() or None
+        # Optional manual ATT MTU override; None means "ask the backend".
+        self.mtu = mtu
         self.auth_key = normalize_auth_key(auth_key_hex)
         self._client_factory = client_factory or BleakClient
         self._scanner_factory = scanner_factory or BleakScanner
         self.scan_timeout = scan_timeout
         self.connect_timeout = connect_timeout
         self.auth_timeout = auth_timeout
+        self._session_mtu: Optional[int] = None
 
         self.client: Optional[BleakClient] = None
         self.authenticated = False
@@ -338,6 +417,11 @@ class MiBand6Client:
 
     # ------------------------------------------------------------- properties
     @property
+    def mac_address(self) -> str:
+        """Backwards-compatible alias for :attr:`device_id`."""
+        return self.device_id
+
+    @property
     def disconnected_event(self) -> asyncio.Event:
         """Event set when the BLE link drops unexpectedly (watchdog signal)."""
         return self._disconnected
@@ -345,14 +429,20 @@ class MiBand6Client:
     async def wait_until_disconnected(self) -> None:
         await self._disconnected.wait()
 
+    def _describe_target(self) -> str:
+        """Human-readable discovery target for logs and timeout messages."""
+        if self.device_name:
+            return f"{self.device_id} (or a name containing {self.device_name!r})"
+        return self.device_id
+
     # ---------------------------------------------------------------- discovery
     async def _discover_device(self, scan_timeout: float):
         found_device = None
         stop_event = asyncio.Event()
 
-        def _on_detection(device, _advertisement) -> None:
+        def _on_detection(device, advertisement) -> None:
             nonlocal found_device
-            if str(getattr(device, "address", "")).upper() == self.mac_address.upper():
+            if device_matches(self.device_id, self.device_name, device, advertisement):
                 found_device = device
                 stop_event.set()
 
@@ -364,9 +454,12 @@ class MiBand6Client:
                 await asyncio.wait_for(stop_event.wait(), timeout=scan_timeout)
             except asyncio.TimeoutError:
                 raise TimeoutError(
-                    f"Could not discover band {self.mac_address} within {scan_timeout:.0f}s. "
+                    f"Could not discover band {self._describe_target()} "
+                    f"within {scan_timeout:.0f}s. "
                     "Please verify: 1) Phone Bluetooth is OFF / Airplane mode. "
-                    "2) Band screen is touched and lit."
+                    "2) Band screen is touched and lit. "
+                    "3) The device identifier matches this platform "
+                    "(on macOS use the CoreBluetooth UUID shown by scan_ble.py)."
                 ) from None
         finally:
             heartbeat.cancel()
@@ -404,7 +497,8 @@ class MiBand6Client:
         self._prv_key, self._pub_key = generate_ecdh_keys()
 
         logger.info(
-            "Waiting for Mi Band broadcast at %s (touch/light up band screen)...", self.mac_address
+            "Waiting for Mi Band broadcast at %s (touch/light up band screen)...",
+            self._describe_target(),
         )
         found_device = await self._discover_device(scan_timeout)
         logger.info("Band detected! Establishing BLE link (keep screen awake)...")
@@ -416,7 +510,14 @@ class MiBand6Client:
             disconnected_callback=self._on_disconnected,
         )
         await self.client.connect()
-        logger.info("BLE link established. Initializing chunked transfer listener...")
+        # Resolve the ATT MTU once per session so the chunked writes use a
+        # consistent payload size (and so backends that can only report it
+        # lazily, like BlueZ, are only queried once).
+        self._session_mtu = _resolve_mtu(self.client, self.mtu)
+        logger.info(
+            "BLE link established. Initializing chunked transfer listener (MTU=%d)...",
+            self._session_mtu,
+        )
 
         await self.client.start_notify(UUID_CHAR_CHUNKED_READ, self._on_chunked_notification)
 
@@ -428,6 +529,7 @@ class MiBand6Client:
             CHUNKED_ENDPOINT_AUTH,
             0,
             initial_auth,
+            mtu=self._session_mtu,
         )
 
         try:
@@ -446,7 +548,7 @@ class MiBand6Client:
     def _on_disconnected(self, _client: object) -> None:
         if self._closing:
             return
-        logger.warning("BLE link to %s lost (signal watchdog).", self.mac_address)
+        logger.warning("BLE link to %s lost (signal watchdog).", self.device_id)
         if self._keepalive_task is not None and not self._keepalive_task.done():
             self._keepalive_task.cancel()
         self._disconnected.set()
@@ -456,6 +558,7 @@ class MiBand6Client:
         self.authenticated = False
         self._auth_error = None
         self._auth_event.clear()
+        self._session_mtu = None
         self._handle = 0
         self._reassemble_ptr = 0
         self._expected_bytes = 0
@@ -613,6 +716,7 @@ class MiBand6Client:
                 CHUNKED_ENDPOINT_AUTH,
                 self._handle,
                 response,
+                mtu=self._session_mtu,
             )
         except Exception as exc:
             logger.error("Failed to complete auth step 2: %s", exc)
@@ -622,7 +726,7 @@ class MiBand6Client:
     def _on_heart_rate_notification(self, _sender, data: bytearray) -> None:
         try:
             bpm = parse_heart_rate(data)
-            logger.info("❤️  Current Heart Rate: %d BPM", bpm)
+            logger.info("[HR] Current Heart Rate: %d BPM", bpm)
             if self._hr_callback:
                 self._hr_callback(bpm)
         except Exception as exc:
@@ -632,7 +736,7 @@ class MiBand6Client:
         try:
             steps_info = parse_realtime_steps(data)
             logger.info(
-                "👟 Steps: %d | Distance: %d m | Calories: %d kcal",
+                "[STEPS] Steps: %d | Distance: %d m | Calories: %d kcal",
                 steps_info["steps"],
                 steps_info["distance_meters"],
                 steps_info["calories"],
@@ -648,7 +752,7 @@ class MiBand6Client:
             if sensor_info["samples"]:
                 first = sensor_info["samples"][0]
                 logger.debug(
-                    "📊 IMU [Seq %d, %d samples] Accel: (%.2fg, %.2fg, %.2fg)",
+                    "[IMU] Seq %d, %d samples, accel: (%.2fg, %.2fg, %.2fg)",
                     sensor_info["sequence"],
                     sensor_info["sample_count"],
                     first["ax_g"],
@@ -807,7 +911,7 @@ async def _sync_band_history(
 
 
 async def run_monitor(
-    mac_address: str,
+    device_id: str,
     auth_key_hex: str,
     *,
     duration: Optional[int] = None,
@@ -818,12 +922,20 @@ async def run_monitor(
     reconnect_initial_delay: float = 1.0,
     reconnect_max_delay: float = 30.0,
     sync_history_days: Optional[int] = None,
+    device_name: Optional[str] = None,
+    mtu: Optional[int] = None,
     client_factory: Optional[Callable[[str, str], MiBand6Client]] = None,
 ) -> None:
     """Connect + stream until *duration* elapses, reconnecting with backoff."""
     callbacks = callbacks or StreamCallbacks()
     make_client = client_factory or (
-        lambda mac, key: MiBand6Client(mac, key, scan_timeout=scan_timeout)
+        lambda device, key: MiBand6Client(
+            device,
+            key,
+            device_name=device_name,
+            mtu=mtu,
+            scan_timeout=scan_timeout,
+        )
     )
     deadline = None if duration is None else time.monotonic() + duration
     attempt = 0
@@ -835,7 +947,7 @@ async def run_monitor(
             return
 
         attempt += 1
-        client = make_client(mac_address, auth_key_hex)
+        client = make_client(device_id, auth_key_hex)
         failure: Optional[BaseException] = None
         try:
             await client.connect_and_authenticate(scan_timeout=scan_timeout)
@@ -892,13 +1004,14 @@ async def run_monitor(
 
 
 async def run_demo(
-    mac_address: str,
+    device_id: str,
     auth_key_hex: str,
     *,
     duration: Optional[int] = None,
     imu: bool = False,
     callbacks: Optional[StreamCallbacks] = None,
     sync_history_days: Optional[int] = None,
+    mtu: Optional[int] = None,
 ) -> None:
     """Run the full client stack against the in-memory simulator (no hardware)."""
     from sim_band import FakeBleakScanner, SimulatedBand, simulated_factories
@@ -907,19 +1020,20 @@ async def run_demo(
     sim_client_factory, _scanner_factory = simulated_factories(band)
 
     class _DemoScanner(FakeBleakScanner):
-        default_address = mac_address
+        default_address = device_id
 
     def _factory(mac: str, key: str) -> MiBand6Client:
         return MiBand6Client(
             mac,
             key,
+            mtu=mtu,
             client_factory=sim_client_factory,
             scanner_factory=_DemoScanner,
         )
 
     logger.info("DEMO MODE: using an in-memory simulated Mi Band 6 (no Bluetooth needed).")
     await run_monitor(
-        mac_address,
+        device_id,
         auth_key_hex,
         duration=duration,
         imu=imu,
@@ -929,6 +1043,7 @@ async def run_demo(
         reconnect_initial_delay=0.2,
         reconnect_max_delay=1.0,
         sync_history_days=sync_history_days,
+        mtu=mtu,
         client_factory=_factory,
     )
 
@@ -942,6 +1057,17 @@ def _configure_logging(level_name: str) -> None:
         level=level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    # Windows: when stdout/stderr are redirected to a file the console encoding
+    # may be a legacy code page (cp1252/cp936) that cannot encode every log
+    # message.  Replace instead of raising so a redirected run never aborts
+    # just because of decoration characters.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="replace")
+            except (ValueError, OSError):  # pragma: no cover - defensive
+                pass
 
 
 def _env_float(name: str, default: float) -> float:
@@ -977,6 +1103,34 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="collection duration in seconds (default: until Ctrl+C)",
     )
     parser.add_argument("--imu", action="store_true", help="also stream raw IMU accelerometer data")
+    parser.add_argument(
+        "--device-id",
+        default=_env_device_id(),
+        metavar="ID",
+        help=(
+            "Bluetooth MAC address (Linux/Windows) or CoreBluetooth UUID (macOS) "
+            "of the band; defaults to DEVICE_ID / legacy DEVICE_MAC from .env"
+        ),
+    )
+    parser.add_argument(
+        "--device-name",
+        default=os.getenv("DEVICE_NAME", ""),
+        metavar="NAME",
+        help=(
+            "optional advertised-name substring used as an extra discovery match "
+            "(useful on macOS where no MAC address is exposed; default: DEVICE_NAME env)"
+        ),
+    )
+    parser.add_argument(
+        "--mtu",
+        type=int,
+        default=_env_optional_int("BLE_MTU"),
+        metavar="BYTES",
+        help=(
+            "override the ATT MTU used to size chunked auth writes "
+            "(default: auto-detect, floor 23; env: BLE_MTU)"
+        ),
+    )
     parser.add_argument(
         "--sync-history",
         nargs="?",
@@ -1046,14 +1200,24 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 async def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
     _configure_logging(args.log_level)
+    logger.info("ECDH backend: %s", ecdh_backend_name())
 
-    mac = (os.getenv("DEVICE_MAC") or "").strip()
+    device_id = (args.device_id or "").strip()
+    device_name = (args.device_name or "").strip() or None
     key = (os.getenv("AUTH_KEY") or "").strip()
     demo = args.demo or os.getenv("DEMO_MODE", "0").lower() in ("1", "true", "yes", "on")
 
+    if args.mtu is not None and not (23 <= args.mtu <= 517):
+        logger.error(
+            "Invalid --mtu %s: ATT MTU must be between 23 and 517 bytes. "
+            "Leave it unset to auto-detect.",
+            args.mtu,
+        )
+        return 1
+
     if demo:
-        if not mac or mac.upper().startswith("XX:"):
-            mac = DEMO_DEFAULT_MAC
+        if is_placeholder_device_id(device_id):
+            device_id = DEMO_DEFAULT_MAC
         try:
             normalize_auth_key(key)
         except ValueError:
@@ -1062,10 +1226,11 @@ async def main(argv: Optional[list[str]] = None) -> int:
             )
             key = DEMO_DEFAULT_AUTH_KEY
     else:
-        if not mac or mac.upper().startswith("XX:") or not key or key.startswith("012345"):
+        if is_placeholder_device_id(device_id) or not key or key.startswith("012345"):
             logger.error(
-                "Please configure DEVICE_MAC and AUTH_KEY in .env before running "
-                "(or run with --demo)."
+                "Please configure DEVICE_ID (Bluetooth address, or macOS UUID) "
+                "and AUTH_KEY in .env before running (or run with --demo). "
+                "Legacy DEVICE_MAC is still accepted."
             )
             return 1
         try:
@@ -1073,6 +1238,12 @@ async def main(argv: Optional[list[str]] = None) -> int:
         except ValueError as exc:
             logger.error("Invalid AUTH_KEY: %s", exc)
             return 1
+
+    logger.info(
+        "Discovery target: %s%s",
+        device_id,
+        f" (name filter: {device_name!r})" if device_name else "",
+    )
 
     store = TelemetryStore(args.output, backend=args.storage)
 
@@ -1146,16 +1317,17 @@ async def main(argv: Optional[list[str]] = None) -> int:
     try:
         if demo:
             await run_demo(
-                mac,
+                device_id,
                 key,
                 duration=args.duration,
                 imu=args.imu,
                 callbacks=callbacks,
                 sync_history_days=args.sync_history,
+                mtu=args.mtu,
             )
         else:
             await run_monitor(
-                mac,
+                device_id,
                 key,
                 duration=args.duration,
                 imu=args.imu,
@@ -1163,6 +1335,8 @@ async def main(argv: Optional[list[str]] = None) -> int:
                 scan_timeout=args.scan_timeout,
                 reconnect=not args.no_reconnect,
                 sync_history_days=args.sync_history,
+                device_name=device_name,
+                mtu=args.mtu,
             )
     except KeyboardInterrupt:
         logger.info("Stopping on user request...")

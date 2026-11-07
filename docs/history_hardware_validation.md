@@ -52,9 +52,9 @@
 
 ### 环境
 
-- Linux + BlueZ（WSL2 需 USB 蓝牙直通；`bluetoothctl` 可用）。
-- 项目依赖已安装（`.venv` 或系统环境），`python -m pytest -q` 在无硬件条件下应为 **62 passed**。
-- `gcc` 可用（若 `libecdh.so` 缺失会现场编译）。
+- Linux + BlueZ（WSL2 需 USB 蓝牙直通；`bluetoothctl` 可用）；Windows 用原生系统（WinRT），不要用 WSL2 的蓝牙。
+- 项目依赖已安装（`.venv` 或系统环境），`python -m pytest -q` 在无硬件条件下应为 **88 passed**。
+- 编译器非必需：有 `gcc`/`clang` 时用原生 ECDH，没有则自动回退纯 Python（日志会打印 `ECDH backend`）。
 - 电脑时区与手环时区一致（协议按下述“本地墙上时间”编码）：
   ```bash
   timedatectl    # 确认 Time zone；必要时 sudo timedatectl set-timezone Asia/Shanghai
@@ -64,7 +64,7 @@
 
 - 手环电量 ≥ 30%，佩戴中，屏幕可点亮；**手机蓝牙关闭 / 飞行模式**。
 - 手环里确实有历史数据：Zepp Life / Zepp App 中能看到最近的活动记录/血氧记录。
-- `.env` 中 `DEVICE_MAC`、`AUTH_KEY` 已配置且能完成实时连接。
+- `.env` 中 `DEVICE_ID`（或旧版 `DEVICE_MAC`）、`AUTH_KEY` 已配置且能完成实时连接。
 - 先跑一次基线（不涉及 ⑦）：
   ```bash
   .venv/bin/python miband_client.py 20 --storage none

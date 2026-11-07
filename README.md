@@ -9,7 +9,8 @@
 
 | 能力 | 说明 |
 |---|---|
-| 手环直连 | 基于 [`bleak`](https://github.com/hbldh/bleak)（Linux/BlueZ）扫描、连接、断连自动重连 |
+| 手环直连 | 基于 [`bleak`](https://github.com/hbldh/bleak) 扫描、连接、断连自动重连（Linux/BlueZ、Windows/WinRT、macOS/CoreBluetooth） |
+| 跨平台 | Linux / Windows 10+ / macOS；ECDH 原生库不可用时自动回退纯 Python（无需编译器） |
 | 安全认证 | 华米 Chunked Transfer + NIST B-163 ECDH + AES-CBC 挑战响应；分片重组带序号校验/越界保护/重复包处理 |
 | 心率 | 标准 BLE SIG Heart Rate 服务（`0x2A37` / `0x2A39`），连续测量 + 12s 保活 |
 | 实时步数 | 私有特征 `0x0007`：步数 / 距离 / 卡路里 |
@@ -23,7 +24,7 @@
 | CSV 导出 | 从 SQLite 导出 5 张 CSV 表 |
 | 自动重连 | 会话失败/链路丢失后指数退避重连；心率保活失败也会触发重连 |
 | 无硬件演示 | `--demo` 使用内置模拟手环跑通完整链路（认证、数据流、历史同步、落盘、导出） |
-| 测试 | 62 个单元/集成测试，含模拟 BLE 后端，**不需要真实手环** |
+| 测试 | 88 个单元/集成测试，含模拟 BLE 后端，**不需要真实手环**；CI 覆盖 Linux/Windows/macOS |
 
 ---
 
@@ -82,18 +83,20 @@ miband_health_monitor/
 ├── band_history.py         # 手环侧历史数据拉取（0x0004/0x0005，实验性）
 ├── history_report.py       # 本地 SQLite 历史汇总报告（CLI）
 ├── sim_band.py             # 内存版模拟手环 + 假 bleak 后端（--demo 与测试共用）
-├── ecdh_wrapper.py         # ctypes 封装 libecdh.so（B-163 ECDH）
-├── ecdh.c / ecdh.h         # tiny-ECDH C 实现（缺失 .so 时自动 gcc 编译）
-├── libecdh.so              # 预编译产物
+├── ecdh_wrapper.py         # ECDH 双后端：原生 tiny-ECDH（ctypes）+ 纯 Python 回退
+├── ecdh.c / ecdh.h         # tiny-ECDH C 实现（Linux 优先使用，缺库时自动编译）
+├── libecdh.so              # Linux x86-64 预编译产物（其他平台自动回退）
+├── vendor/tiny_ecdh/       # 纯 Python B-163 ECDH（第三方，MIT，跨平台回退实现）
 ├── get_auth_key.py         # 交互式获取 auth_key（小米账号 / Zepp 账号）
 ├── fetch_by_token.py       # 用浏览器 app_token 获取 auth_key
 ├── huami_token/            # 华米/小米云 API 客户端（第三方，MIT）
-├── scan_ble.py             # 排障：8 秒扫描列表
+├── scan_ble.py             # 排障：8 秒扫描列表（输出 MAC / macOS UUID）
 ├── scan_live.py            # 排障：连续事件扫描（找 MAC）
 ├── test_miband.py          # 原有单元测试（加密/解析器）
-├── tests/                  # 存储、chunked 协议、模拟手环、看板、历史数据测试
+├── tests/                  # 存储、chunked 协议、模拟手环、看板、历史、ECDH 双后端测试
 ├── tools/                  # 诊断工具：capture_history_payload.py（真机 payload 抓取）
-├── docs/                   # 文档：history_hardware_validation.md（⑦ 真机验证清单）
+├── docs/                   # 文档：跨平台指南、真机验证清单
+├── .github/workflows/ci.yml # GitHub Actions：Linux/Windows/macOS 测试矩阵
 ├── requirements.txt
 ├── pytest.ini
 ├── .env.example
@@ -106,32 +109,67 @@ miband_health_monitor/
 
 | 项目 | 要求 |
 |---|---|
-| 操作系统 | **Linux（BlueZ）** 为官方支持路径；Windows/macOS 未验证 |
+| 操作系统 | **Linux（BlueZ）**、**Windows 10 19041+（WinRT）**、**macOS 12+（CoreBluetooth）** |
 | Python | ≥ 3.10（使用 `X | Y` 类型注解；开发环境 3.13） |
-| 蓝牙 | 主机自带或 USB 蓝牙适配器；WSL2 需 `usbipd` 直通并安装 BlueZ |
-| 其他 | 首次自动编译 `ecdh.c` 需要 `gcc`（也可直接使用仓库内 `libecdh.so`） |
+| 蓝牙 | 主机自带或 USB 蓝牙适配器；WSL2 需 `usbipd` 直通并安装 BlueZ（见下） |
+| 编译器 | **可选**。Linux 有 `gcc`/`clang` 时自动编译加速；没有也可用纯 Python 回退 |
+| 依赖 | `bleak` 会按平台自动安装 WinRT / pyobjc 后端，无需手工处理 |
 
 > **WSL2 注意**：默认 WSL2 没有蓝牙栈（无 `/sys/class/bluetooth`、无 `bluetooth.service`），
 > 必须把 USB 蓝牙适配器直通进 WSL，或直接在原生 Linux 上运行。
+>
+> Windows、Linux 的分步安装/排障/真机验证清单见 [`docs/cross_platform.md`](docs/cross_platform.md)。
+
+三平台的关键差异（代码已处理，排障时对照）：
+
+| 平台 | 设备标识 | BLE 后端 | 备注 |
+|---|---|---|---|
+| Linux | 蓝牙 MAC（`DEVICE_ID`） | BlueZ（`dbus-fast`） | 需要 `bluetooth` 服务运行 |
+| Windows 10/11 | 蓝牙 MAC（`DEVICE_ID`） | WinRT | 首次使用需在“设置 → 蓝牙”里确认适配器可用 |
+| macOS | **CoreBluetooth UUID**（`DEVICE_ID`）或 `DEVICE_NAME` | CoreBluetooth | 系统不暴露 MAC；终端首次需授予蓝牙权限 |
 
 ---
 
 ## 5. 安装
 
+Linux / macOS：
+
 ```bash
 cd miband_health_monitor
 
 # 推荐：项目内虚拟环境（某些系统 site-packages 只读时尤其需要）
-python -m venv .venv
+python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 
 # 或者直接装进当前环境
-python -m pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
+```
+
+Windows（PowerShell / cmd）：
+
+```powershell
+cd miband_health_monitor
+
+# 推荐用 python.org 的 Python 3.10+；Windows 下虚拟环境入口是 Scripts\python.exe
+py -3 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# 激活虚拟环境（可选）
+.\.venv\Scripts\Activate.ps1        # PowerShell
+.venv\Scripts\activate.bat          # cmd
 ```
 
 依赖说明：`bleak`、`cryptography`、`python-dotenv` 为运行必需；
 `loguru`、`pycryptodome`、`requests` 供 `get_auth_key.py` / `fetch_by_token.py` 使用；
-`pytest`、`pytest-asyncio` 供测试使用。
+`pytest`、`pytest-asyncio` 供测试使用。`bleak` 会按平台自动拉取 WinRT（Windows）
+或 pyobjc（macOS）后端依赖。
+
+> 为简洁起见，下文示例统一写 `.venv/bin/python`；**Windows 请替换为
+> `.venv\Scripts\python.exe`**（路径分隔符同理）。
+
+> 不需要编译器：纯 Python 回退在没有 `libecdh` 的平台上自动启用；
+> 若想在 Windows 上使用更快的原生实现，可自行编译 `ecdh.dll` 并放到项目根目录
+> （或用 `MIBAND_ECDH_LIB` 指定路径），详见 [`docs/cross_platform.md`](docs/cross_platform.md)。
 
 ---
 
@@ -145,8 +183,11 @@ cp .env.example .env
 
 | 变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|
-| `DEVICE_MAC` | 是 | — | 手环蓝牙 MAC，如 `C0:FF:EE:C0:FF:EE` |
+| `DEVICE_ID` | 是 | — | 手环标识：Linux/Windows 用 MAC（如 `C0:FF:EE:C0:FF:EE`）；macOS 用 CoreBluetooth UUID |
+| `DEVICE_MAC` | 否 | — | 旧版别名，仍兼容；同时配置时 `DEVICE_ID` 优先（占位符会被忽略） |
+| `DEVICE_NAME` | 否 | — | 广播名子串匹配（大小写不敏感），如 `Mi Smart Band`；macOS/多设备时很实用 |
 | `AUTH_KEY` | 是 | — | 32 位十六进制认证密钥（16 字节） |
+| `BLE_MTU` | 否 | 自动 | 手动覆盖 ATT MTU（23–517）；一般留空，自动探测 |
 | `OUTPUT_DIR` | 否 | `data` | JSONL 与 `mi_band.db` 输出目录 |
 | `STORAGE_BACKEND` | 否 | `both` | `jsonl` / `sqlite` / `both` / `none` |
 | `SCAN_TIMEOUT` | 否 | `90` | 等待手环广播的秒数 |
@@ -155,8 +196,12 @@ cp .env.example .env
 | `WEB_PORT` | 否 | — | 实时看板端口；留空/注释关闭，`0` 表示随机空闲端口 |
 | `WEB_HOST` | 否 | `127.0.0.1` | 看板绑定地址；默认仅本机可访问 |
 | `HISTORY_DAYS` | 否 | — | 设为 N 等价于 `--sync-history N`（连接后同步手环历史） |
+| `MIBAND_ECDH_BACKEND` | 否 | `auto` | 诊断用：`auto` / `native` / `python`（强制 ECDH 实现） |
 
 `.env` 已被 `.gitignore` 忽略，**不要提交真实 auth_key**。
+
+> Windows 上复制模板用 `copy .env.example .env`，改完可用
+> `.venv\Scripts\python.exe scan_ble.py` 确认能扫到手环并核对地址。
 
 ### 获取 auth_key（三选一）
 
@@ -187,6 +232,8 @@ cp .env.example .env
 
 ## 7. 运行
 
+Linux / macOS（虚拟环境内）：
+
 ```bash
 # 无硬件先跑通全链路（模拟手环，2 秒，含 IMU 与 CSV 导出）
 .venv/bin/python miband_client.py --demo 2 --imu --output data/demo --export-csv
@@ -213,8 +260,20 @@ cp .env.example .env
 .venv/bin/python history_report.py --hours 24
 .venv/bin/python history_report.py --hours 168 --json
 
-# 排障：先确认能扫到手环
+# 排障：先确认能扫到手环（macOS 会打印 UUID）
+.venv/bin/python scan_ble.py
 .venv/bin/python scan_live.py
+```
+
+Windows（PowerShell，把 `python` 换成虚拟环境路径即可）：
+
+```powershell
+.venv\Scripts\python.exe miband_client.py --demo 2 --imu --output data\demo --export-csv
+.venv\Scripts\python.exe miband_client.py 60
+.venv\Scripts\python.exe miband_client.py --web-port 8080
+.venv\Scripts\python.exe miband_client.py 60 --sync-history 7
+.venv\Scripts\python.exe history_report.py --hours 24
+.venv\Scripts\python.exe scan_ble.py
 ```
 
 ### CLI 参数
@@ -226,6 +285,9 @@ duration              采集秒数；省略则一直运行到 Ctrl+C
 --imu                 同时采集原始 IMU 加速度（约 25Hz）
 --sync-history [DAYS] 连接后拉取最近 DAYS 天手环历史（默认 7；实验性）
 --demo                使用内存模拟手环（无需蓝牙硬件）
+--device-id ID        覆盖 DEVICE_ID（MAC；macOS 为 UUID）
+--device-name NAME    广播名子串匹配（额外发现条件，macOS 友好）
+--mtu BYTES           手动覆盖 ATT MTU（23–517；默认自动探测）
 --web-port PORT       启动实时看板/HTTP API（0 = 随机空闲端口）
 --web-host HOST       看板绑定地址（默认 127.0.0.1）
 --output DIR          输出目录（默认 $OUTPUT_DIR 或 data）
@@ -236,12 +298,23 @@ duration              采集秒数；省略则一直运行到 Ctrl+C
 --no-reconnect        出错/断连后不自动重连
 ```
 
+启动日志的前两行会打印当前 ECDH 后端与设备发现目标，反馈问题时请一并附上，例如：
+
+```
+[INFO] MiBand6Client: ECDH backend: python
+[INFO] MiBand6Client: Discovery target: C0:FF:EE:C0:FF:EE
+```
+
 真机使用要点：
 
 - **手机蓝牙关闭 / 开飞行模式**，否则手环被手机占连，无法广播；
 - 扫描期间**点亮并滑动/触摸手环屏幕**，手环屏幕熄灭会停止广播；
 - 首次连接时手环可能震动或提示确认，按提示操作；
-- 心率传感器在自动重连后会自动重新开启。
+- 心率传感器在自动重连后会自动重新开启；
+- **Windows**：确认“设置 → 蓝牙和其他设备”中蓝牙已开启且适配器支持 BLE；如果设备之前
+  被系统连接过，先在“蓝牙和其他设备”里“删除设备”再重试；
+- **macOS**：`DEVICE_ID` 要填 CoreBluetooth UUID（`scan_ble.py` 输出），或改用
+  `DEVICE_NAME` 匹配；首次运行终端会弹窗请求蓝牙权限，需允许。
 
 ---
 
@@ -400,13 +473,17 @@ python export_csv.py --db data/mi_band.db --output data/csv
 覆盖内容：
 
 - `test_miband.py`：AES 测试向量、心率/步数/IMU 解析、密钥格式；
+- `tests/test_ecdh_backends.py`：原生 C 与纯 Python ECDH 的**逐字节交叉校验**、后端选择、各平台库文件名；
+- `tests/test_device_matching.py`：MAC/UUID/名称匹配、占位符与环境变量优先级、CLI 参数、macOS 式按名称发现；
 - `tests/test_storage.py`：时间戳、JSONL/SQLite 写入（含血氧/活动历史）、CSV 导出、关闭后写入丢弃；
-- `tests/test_chunked_protocol.py`：分块帧格式、MTU 协商、认证重组（序号缺口/重复/越界/非法长度）；
+- `tests/test_chunked_protocol.py`：分块帧格式、MTU 协商与透传、认证重组（序号缺口/重复/越界/非法长度）；
 - `tests/test_simulated_band.py`：模拟手环端到端认证、三类实时数据流、断连续连、落盘与导出；
 - `tests/test_dashboard.py`：遥测 Hub、HTTP API、SSE 实时推送、看板路由与回退页；
 - `tests/test_history.py`：时间编码、血氧/活动解析、模拟 fetch 协议（含丢包）、历史落盘、历史报告、CLI。
 
-预期结果：`62 passed`。
+预期结果：`88 passed`。`--demo` 全链路（含 ECDH、存储、导出）不依赖蓝牙硬件，
+可作为 Windows/macOS 上的冒烟测试；`.github/workflows/ci.yml` 会在 Linux/Windows/macOS
+三平台运行同一套测试。
 
 ---
 
@@ -415,7 +492,10 @@ python export_csv.py --db data/mi_band.db --output data/csv
 | 现象 | 原因/处理 |
 |---|---|
 | `No Bluetooth adapters found` / `org.bluez was not provided` | 本机无蓝牙栈（如 WSL2 未直通、`bluetooth` 服务未启动）。安装/启动 BlueZ，或直通 USB 蓝牙适配器。 |
-| 90 秒内扫描不到手环 | 手机关蓝牙；点亮并触摸手环屏幕；确认 `.env` 的 MAC 正确；用 `scan_live.py` 验证。 |
+| Windows：`OSError: [WinError 193]` 或加载 `libecdh.so` 失败 | 已修复：Windows 会跳过 Linux 的 `.so` 并自动回退纯 Python。若仍看到，请升级到当前版本或设 `MIBAND_ECDH_BACKEND=python`。 |
+| Windows：`BLE device not found` / 连接被拒绝 | 在“设置 → 蓝牙和其他设备”确认适配器可用；删除该设备的旧配对记录；关闭手机蓝牙；必要时用 `scan_ble.py` 确认地址。 |
+| macOS：扫描不到 / 地址对不上 | macOS 不暴露 MAC：用 `scan_ble.py` 输出的 **UUID** 填 `DEVICE_ID`，或配置 `DEVICE_NAME`；并在“系统设置 → 隐私与安全性 → 蓝牙”中允许终端。 |
+| 90 秒内扫描不到手环 | 手机关蓝牙；点亮并触摸手环屏幕；确认 `.env` 的 MAC/UUID 正确；用 `scan_ble.py` 验证。 |
 | 认证超时 | 分块通知丢失或固件行为差异；查看 `--log-level DEBUG`。客户端会在下次会话自动重试。 |
 | 认证成功但心率不动 | 手环需佩戴贴合；`0x2A39` 控制序列可能被固件拒绝；重连一次或重启手环。 |
 | IMU 无数据 | 部分固件需先进入特定运动模式；`--imu` 为实验性功能。 |
@@ -435,7 +515,8 @@ python export_csv.py --db data/mi_band.db --output data/csv
 - 仅覆盖心率 / 步数 / IMU / 血氧(历史) / 活动(历史)；压力、睡眠分期、训练详情、电量等尚未实现；
 - IMU 为实验性私有协议，采样率与量程以固件为准；
 - 看板为单机内存视图，刷新页面只保留最近若干点；长期历史请查 SQLite/CSV；
-- Windows/macOS 的 BLE 后端未验证（代码使用 bleak 通用 API，理论上可移植）；
+- Windows/macOS 已完成代码层兼容（BLE 通用 API + ECDH 纯 Python 回退 + 设备标识抽象），
+  但**真机行为仍需在对应系统上验证**，验证清单见 [`docs/cross_platform.md`](docs/cross_platform.md)；
 - 断连检测依赖连接回调与心率保活，极端情况下最长约 12 秒才发现链路丢失。
 
 ---
@@ -446,6 +527,9 @@ python export_csv.py --db data/mi_band.db --output data/csv
 - 看板/HTTP API 默认只绑定 `127.0.0.1` 且无鉴权，请勿直接暴露到公网。
 - `huami_token/` 来自第三方 `huami-token` 项目（MIT License, © 2025 Kirill Snezhko），
   用于获取 auth_key；`ecdh.c/ecdh.h` 为 tiny-ECDH 的 C 实现。
+- `vendor/tiny_ecdh/` 为第三方 `tiny-ECDH-python` 0.1.0（MIT License,
+  © 2023 Daniel Oliveira），作为无原生库平台上的纯 Python ECDH 回退；
+  与本项目 C 实现逐字节交叉校验（`tests/test_ecdh_backends.py`）。
 - Chunked ECDH 与历史 fetch 协议参考 Gadgetbridge 项目（AGPL-3.0）的公开逆向成果，
   本项目为独立 Python 实现，未复制其源代码。
 - 本项目仅用于个人健康数据的自主采集与分析，请遵守手环使用条款与当地隐私法规。

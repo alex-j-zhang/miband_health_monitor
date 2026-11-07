@@ -642,6 +642,8 @@ def make_simulated_client(
     band: SimulatedBand,
     *,
     scanner_address: Optional[str] = None,
+    device_name: Optional[str] = None,
+    mtu: Optional[int] = None,
 ) -> MiBand6Client:
     """Build a real :class:`MiBand6Client` wired to the fake backend."""
     client_factory, scanner_factory = simulated_factories(band)
@@ -650,6 +652,8 @@ def make_simulated_client(
     return MiBand6Client(
         mac,
         auth_key_hex,
+        device_name=device_name,
+        mtu=mtu,
         client_factory=client_factory,
         scanner_factory=scanner_factory,
     )

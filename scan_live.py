@@ -1,7 +1,15 @@
-"""Continuous BLE scanner that logs any packet immediately."""
+"""Continuous BLE scanner that logs any packet immediately.
+
+Useful when the band only advertises for a short window.  The printed
+``address`` is what goes into ``DEVICE_ID``: a MAC on Linux/Windows, a
+CoreBluetooth UUID on macOS.
+"""
 
 import asyncio
+
 from bleak import BleakScanner
+
+SCAN_SECONDS = 15
 
 
 async def main():
@@ -10,13 +18,15 @@ async def main():
         print(f"[FOUND] {device.address} | Name: {name} | RSSI: {advertisement_data.rssi}")
 
     scanner = BleakScanner(detection_callback=detection_callback)
-    print("Starting continuous live BLE scan for 15 seconds. Please tap your band...")
+    print(
+        f"Starting continuous live BLE scan for {SCAN_SECONDS} seconds. "
+        "Tap and keep sliding the band screen..."
+    )
     await scanner.start()
-    await asyncio.sleep(15)
+    await asyncio.sleep(SCAN_SECONDS)
     await scanner.stop()
-    print("Scan finished.")
+    print("Scan finished. Put the band's address/UUID into DEVICE_ID (or use DEVICE_NAME).")
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-

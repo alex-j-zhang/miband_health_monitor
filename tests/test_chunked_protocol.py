@@ -214,3 +214,55 @@ async def test_reassembly_rejects_unknown_auth_step():
 
     assert client._auth_error is not None
     assert "unexpected auth step" in client._auth_error
+
+
+# ---------------------------------------------------------------------------
+# Session MTU plumbing: the client resolves the MTU once per connection and
+# forwards it to every chunked write (needed because Windows/macOS backends
+# report different values than BlueZ).
+# ---------------------------------------------------------------------------
+async def test_client_forwards_configured_mtu_to_chunked_writes(monkeypatch):
+    import miband_client as client_module
+    from sim_band import SimulatedBand, make_simulated_client
+
+    captured: list = []
+    real_write = client_module.write_chunked_value
+
+    async def spy(*args, **kwargs):
+        captured.append(kwargs.get("mtu"))
+        await real_write(*args, **kwargs)
+
+    monkeypatch.setattr(client_module, "write_chunked_value", spy)
+    band = SimulatedBand(auth_key=bytes.fromhex(KEY))
+    client = make_simulated_client(MAC, KEY, band, scanner_address=MAC, mtu=185)
+    try:
+        await client.connect_and_authenticate(scan_timeout=2.0)
+        assert client.authenticated is True
+    finally:
+        await client.disconnect()
+
+    # One write for the client public key, one for the auth step-2 response.
+    assert captured == [185, 185]
+
+
+async def test_client_uses_backend_mtu_when_not_configured(monkeypatch):
+    import miband_client as client_module
+    from sim_band import SimulatedBand, make_simulated_client
+
+    captured: list = []
+    real_write = client_module.write_chunked_value
+
+    async def spy(*args, **kwargs):
+        captured.append(kwargs.get("mtu"))
+        await real_write(*args, **kwargs)
+
+    monkeypatch.setattr(client_module, "write_chunked_value", spy)
+    band = SimulatedBand(auth_key=bytes.fromhex(KEY))
+    client = make_simulated_client(MAC, KEY, band, scanner_address=MAC)
+    try:
+        await client.connect_and_authenticate(scan_timeout=2.0)
+        assert client._session_mtu == CHUNKED_DEFAULT_MTU
+    finally:
+        await client.disconnect()
+
+    assert captured == [CHUNKED_DEFAULT_MTU, CHUNKED_DEFAULT_MTU]

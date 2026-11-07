@@ -12,7 +12,8 @@ Usage::
     python tools/capture_history_payload.py --days 7 --output validation/payloads
     python tools/capture_history_payload.py --days 1 --timeout 20
 
-Requires ``.env`` with ``DEVICE_MAC`` / ``AUTH_KEY`` (see README).
+Requires ``.env`` with ``DEVICE_ID`` (or legacy ``DEVICE_MAC``) / ``AUTH_KEY``
+(see README).
 """
 
 from __future__ import annotations
@@ -50,10 +51,14 @@ def _data_type_name(data_type: int) -> str:
 
 async def _run(args: argparse.Namespace) -> int:
     load_dotenv()
-    mac = (os.getenv("DEVICE_MAC") or "").strip()
+    mac = (os.getenv("DEVICE_ID") or os.getenv("DEVICE_MAC") or "").strip()
     key = (os.getenv("AUTH_KEY") or "").strip()
     if not mac or not key:
-        print("[-] DEVICE_MAC / AUTH_KEY missing from environment/.env", file=sys.stderr)
+        print(
+            "[-] DEVICE_ID (or legacy DEVICE_MAC) / AUTH_KEY missing from "
+            "environment/.env",
+            file=sys.stderr,
+        )
         return 1
     try:
         normalize_auth_key(key)

@@ -15,7 +15,7 @@ from huami_token.zepp import ZeppClient, ZeppSession
 
 ENV_PATH = Path(__file__).parent / ".env"
 
-try:  # optional convenience: pick up DEVICE_MAC from the local .env
+try:  # optional convenience: pick up the configured band identifier from .env
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover
     load_dotenv = None
@@ -23,7 +23,20 @@ if load_dotenv is not None:
     load_dotenv(ENV_PATH)
 
 # Never hard-code a real band MAC in the repository: prefer the configured one.
-TARGET_MAC = (os.getenv("DEVICE_MAC") or "").strip().upper()
+# DEVICE_ID is the cross-platform name; DEVICE_MAC is the legacy alias.
+TARGET_MAC = (os.getenv("DEVICE_ID") or os.getenv("DEVICE_MAC") or "").strip().upper()
+
+
+def _preferred_device_env_key() -> str:
+    """Return the .env key to write the MAC to (DEVICE_ID when present)."""
+    try:
+        text = ENV_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return "DEVICE_MAC"
+    for line in text.splitlines():
+        if line.strip().startswith("DEVICE_ID="):
+            return "DEVICE_ID"
+    return "DEVICE_MAC"
 
 
 def update_env_file(key: str, value: str) -> None:
@@ -145,7 +158,7 @@ def run_extractor() -> int:
             print(f"[+] Key: {found_key}")
             update_env_file("AUTH_KEY", found_key)
             if target_mac:
-                update_env_file("DEVICE_MAC", target_mac)
+                update_env_file(_preferred_device_env_key(), target_mac)
             print(f"[+] Successfully updated {ENV_PATH}")
             print("=" * 60)
             print("\nNext steps:")
@@ -165,5 +178,13 @@ def run_extractor() -> int:
 
 
 if __name__ == "__main__":
+    # Windows 重定向输出时，控制台代码页可能无法编码中文提示；替换而不是抛错。
+    for _stream in (sys.stdout, sys.stderr):
+        _reconfigure = getattr(_stream, "reconfigure", None)
+        if _reconfigure is not None:
+            try:
+                _reconfigure(errors="replace")
+            except (ValueError, OSError):  # pragma: no cover - defensive
+                pass
     sys.exit(run_extractor())
 

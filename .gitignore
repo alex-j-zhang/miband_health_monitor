@@ -86,6 +86,14 @@ build/
 dist/
 *.egg-info/
 *.egg
+# Locally built native ECDH libraries (Linux libecdh.so is tracked on purpose)
+libecdh.dll
+libecdh.dylib
+*.dll
+*.dylib
+*.obj
+*.o
+*.lib
 .venv/
 venv/
 env/
