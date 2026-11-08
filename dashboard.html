@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mi Band 6 实时看板</title>
+<style>
+  :root {
+    --bg: #0f1216; --panel: #171c22; --line: #2a323c; --text: #e6edf3;
+    --muted: #8b98a5; --hr: #ff5c7a; --spo2: #38bdf8; --steps: #4ade80; --imu: #fbbf24;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 20px; border-bottom: 1px solid var(--line);
+  }
+  h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  #status { display: flex; align-items: center; gap: 6px; margin-left: auto;
+            color: var(--muted); font-size: 12px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #64748b; }
+  .dot.on { background: #22c55e; box-shadow: 0 0 8px #22c55e; }
+  .dot.err { background: #ef4444; }
+  main { padding: 16px 20px; display: grid; gap: 14px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .card .label { color: var(--muted); font-size: 12px; }
+  .card .value { font-size: 26px; font-weight: 700; margin-top: 2px; }
+  .card .unit { font-size: 12px; color: var(--muted); margin-left: 4px; font-weight: 400; }
+  .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }
+  .chart { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+  .chart h2 {
+    font-size: 13px; margin: 0 0 8px; color: var(--muted); font-weight: 500;
+    display: flex; justify-content: space-between;
+  }
+  canvas { width: 100%; height: 140px; display: block; }
+  footer { padding: 10px 20px 20px; color: var(--muted); font-size: 12px; }
+  code { color: var(--spo2); }
+</style>
+</head>
+<body>
+<header>
+  <h1>⌚ Mi Band 6 实时看板</h1>
+  <div id="status"><span class="dot" id="dot"></span><span id="statusText">连接中…</span></div>
+</header>
+
+<main>
+  <section class="cards">
+    <div class="card"><div class="label">心率</div>
+      <div class="value"><span id="hr">--</span><span class="unit">BPM</span></div></div>
+    <div class="card"><div class="label">血氧 SpO₂</div>
+      <div class="value"><span id="spo2">--</span><span class="unit">%</span></div></div>
+    <div class="card"><div class="label">步数</div>
+      <div class="value" id="steps">--</div></div>
+    <div class="card"><div class="label">距离</div>
+      <div class="value"><span id="dist">--</span><span class="unit">m</span></div></div>
+    <div class="card"><div class="label">卡路里</div>
+      <div class="value"><span id="cal">--</span><span class="unit">kcal</span></div></div>
+    <div class="card"><div class="label">IMU 合加速度</div>
+      <div class="value"><span id="imu">--</span><span class="unit">g</span></div></div>
+  </section>
+
+  <section class="charts">
+    <div class="chart"><h2><span>心率趋势</span><span id="hrRange"></span></h2>
+      <canvas id="hrChart"></canvas></div>
+    <div class="chart"><h2><span>血氧趋势</span><span id="spo2Range"></span></h2>
+      <canvas id="spo2Chart"></canvas></div>
+    <div class="chart"><h2><span>步数增长</span><span id="stepsRange"></span></h2>
+      <canvas id="stepsChart"></canvas></div>
+    <div class="chart"><h2><span>IMU 合加速度</span><span id="imuRange"></span></h2>
+      <canvas id="imuChart"></canvas></div>
+  </section>
+</main>
+
+<footer>
+  数据来源：Mi Band 6 BLE 直连 · SSE 实时推送 · 已接收 <span id="events">0</span> 条事件 ·
+  last update <span id="updated">--</span><span id="historyNote"></span>
+</footer>
+
+<script>
+"use strict";
+
+const MAX_POINTS = 300;                       // points kept per chart in the browser
+const HISTORY_LIMIT = 300;                    // persisted rows requested on load
+const KINDS = ["heart_rate", "spo2", "steps", "imu"];
+const series = { heart_rate: [], spo2: [], steps: [], imu: [] };
+// Persisted rows are kept apart from the live buffer so every snapshot (the
+// initial fetch AND the first SSE frame) can merge them back without losing
+// history or duplicating points.
+const dbSeries = { heart_rate: [], spo2: [], steps: [], imu: [] };
+const latest = {};
+let messageCount = 0;
+let renderQueued = false;
+
+const el = (id) => document.getElementById(id);
+
+function fmt(value, digits) {
+  if (value === undefined || value === null || Number.isNaN(value)) return "--";
+  return Number(value).toFixed(digits === undefined ? 0 : digits);
+}
+
+function setText(id, text) { const node = el(id); if (node) node.textContent = text; }
+
+function applyLatest(kind, record) {
+  latest[kind] = record;
+  if (kind === "heart_rate") setText("hr", fmt(record.bpm));
+  if (kind === "spo2") setText("spo2", fmt(record.spo2));
+  if (kind === "steps") {
+    setText("steps", fmt(record.steps));
+    setText("dist", fmt(record.distance_m));
+    setText("cal", fmt(record.calories));
+  }
+  if (kind === "imu") setText("imu", fmt(record.magnitude_g, 2));
+  setText("updated", new Date().toLocaleTimeString());
+}
+
+function scheduleRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  window.requestAnimationFrame(() => { renderQueued = false; renderAll(); });
+}
+
+function drawChart(canvasId, data, key, color, options) {
+  const canvas = el(canvasId);
+  if (!canvas) return;
+  options = options || {};
+  const dpr = window.devicePixelRatio || 1;
+  const width = canvas.clientWidth || 320;
+  const height = canvas.clientHeight || 140;
+  const pixelW = Math.round(width * dpr);
+  const pixelH = Math.round(height * dpr);
+  if (canvas.width !== pixelW || canvas.height !== pixelH) {
+    canvas.width = pixelW;
+    canvas.height = pixelH;
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+
+  const pad = { left: 36, right: 8, top: 8, bottom: 18 };
+  const plotW = width - pad.left - pad.right;
+  const plotH = height - pad.top - pad.bottom;
+
+  ctx.strokeStyle = "#2a323c";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let i = 0; i <= 3; i++) {
+    const y = pad.top + plotH * i / 3;
+    ctx.moveTo(pad.left, y);
+    ctx.lineTo(pad.left + plotW, y);
+  }
+  ctx.stroke();
+
+  const values = data.map((row) => row[key]).filter((v) => typeof v === "number");
+  if (values.length < 2) {
+    ctx.fillStyle = "#8b98a5";
+    ctx.font = "12px sans-serif";
+    ctx.fillText("等待数据…", pad.left + 8, pad.top + plotH / 2);
+    return;
+  }
+
+  let lo = Math.min.apply(null, values);
+  let hi = Math.max.apply(null, values);
+  if (options.min !== undefined) lo = Math.min(lo, options.min);
+  if (options.max !== undefined) hi = Math.max(hi, options.max);
+  const span = (hi - lo) || 1;
+  const x = (index) => pad.left + plotW * index / (data.length - 1);
+  const y = (value) => pad.top + plotH * (1 - (value - lo) / span);
+
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.lineJoin = "round";
+  ctx.beginPath();
+  let started = false;
+  data.forEach((row, index) => {
+    const value = row[key];
+    if (typeof value !== "number") return;
+    const px = x(index);
+    const py = y(value);
+    if (!started) { ctx.moveTo(px, py); started = true; } else { ctx.lineTo(px, py); }
+  });
+  ctx.stroke();
+
+  ctx.fillStyle = "#8b98a5";
+  ctx.font = "10px sans-serif";
+  ctx.fillText(String(Math.round(hi)), 2, pad.top + 8);
+  ctx.fillText(String(Math.round(lo)), 2, pad.top + plotH);
+}
+
+function renderAll() {
+  drawChart("hrChart", series.heart_rate, "bpm", "#ff5c7a", { min: 40, max: 180 });
+  drawChart("spo2Chart", series.spo2, "spo2", "#38bdf8", { min: 85, max: 100 });
+  drawChart("stepsChart", series.steps, "steps", "#4ade80", { min: 0 });
+  drawChart("imuChart", series.imu, "magnitude_g", "#fbbf24", { min: 0 });
+
+  const hrValues = series.heart_rate.map((row) => row.bpm).filter((v) => typeof v === "number");
+  setText("hrRange", hrValues.length ? Math.min.apply(null, hrValues) + "–" +
+          Math.max.apply(null, hrValues) + " BPM" : "");
+  const spo2Values = series.spo2.map((row) => row.spo2).filter((v) => typeof v === "number");
+  setText("spo2Range", spo2Values.length ? Math.min.apply(null, spo2Values) + "–" +
+          Math.max.apply(null, spo2Values) + " %" : "");
+  const stepValues = series.steps.map((row) => row.steps).filter((v) => typeof v === "number");
+  setText("stepsRange", stepValues.length ? "总计 " + stepValues[stepValues.length - 1] : "");
+  const imuValues = series.imu.map((row) => row.magnitude_g).filter((v) => typeof v === "number");
+  setText("imuRange", imuValues.length ? "max " + Math.max.apply(null, imuValues).toFixed(2) + " g" : "");
+}
+
+function applyRecord(record) {
+  const kind = record.kind;
+  if (!series[kind]) return;
+  const rows = series[kind];
+  if (rows.length && record.ts < rows[rows.length - 1].ts) {
+    // A late frame (e.g. a band-side timestamp arriving after live samples)
+    // must not corrupt the chronological order of the chart.
+    let index = rows.length - 1;
+    while (index >= 0 && rows[index].ts > record.ts) index -= 1;
+    rows.splice(index + 1, 0, record);
+  } else {
+    rows.push(record);
+  }
+  if (rows.length > MAX_POINTS) rows.shift();
+  if (rows[rows.length - 1] === record) applyLatest(kind, record);
+  messageCount += 1;
+  setText("events", String(messageCount));
+  scheduleRender();
+}
+
+function mergeRows(historyRows, liveRows) {
+  const byTs = new Map();
+  (historyRows || []).forEach((row) => byTs.set(row.ts, row));
+  // Live rows win on a timestamp collision: they are the freshest reading.
+  (liveRows || []).forEach((row) => byTs.set(row.ts, row));
+  return Array.from(byTs.values()).sort((a, b) => a.ts - b.ts).slice(-MAX_POINTS);
+}
+
+function loadDbHistory() {
+  return Promise.all(KINDS.map((kind) =>
+    fetch("/api/history?kind=" + encodeURIComponent(kind) +
+          "&source=db&limit=" + HISTORY_LIMIT)
+      .then((response) => response.ok ? response.json() : null)
+      .then((payload) => {
+        if (payload && Array.isArray(payload.rows)) dbSeries[kind] = payload.rows;
+      })
+      .catch(() => {})   // no provider / no database yet -> live-only view
+  )).then(() => {
+    const total = KINDS.reduce((sum, kind) => sum + dbSeries[kind].length, 0);
+    setText("historyNote", total ? " · 含 " + total + " 条数据库历史" : "");
+  });
+}
+
+function applySnapshot(snapshot) {
+  if (!snapshot || !snapshot.series) return;
+  for (const kind of KINDS) {
+    series[kind] = mergeRows(dbSeries[kind], snapshot.series[kind] || []);
+    const rows = series[kind];
+    if (rows.length) applyLatest(kind, rows[rows.length - 1]);
+  }
+  setText("events", String(snapshot.events_sent || 0));
+  messageCount = snapshot.events_sent || 0;
+  scheduleRender();
+}
+
+function setStatus(text, state) {
+  setText("statusText", text);
+  const dot = el("dot");
+  if (!dot) return;
+  dot.className = "dot" + (state ? " " + state : "");
+}
+
+function connectEvents() {
+  const source = new EventSource("/events");
+  source.onopen = () => setStatus("实时连接", "on");
+  source.onerror = () => setStatus("连接中断，自动重连…", "err");
+  source.onmessage = (event) => {
+    let payload;
+    try { payload = JSON.parse(event.data); } catch (err) { return; }
+    if (payload.type === "snapshot") {
+      applySnapshot(payload);
+    } else {
+      applyRecord(payload);
+    }
+  };
+}
+
+// Load persisted rows BEFORE opening SSE: the stream's first frame is itself a
+// snapshot, and applying it earlier would wipe the history we just fetched.
+Promise.all([
+  fetch("/api/snapshot").then((response) => response.json()).catch(() => null),
+  loadDbHistory(),
+]).then(([snapshot]) => {
+  applySnapshot(snapshot);
+  connectEvents();
+});
+window.addEventListener("resize", scheduleRender);
+</script>
+</body>
+</html>

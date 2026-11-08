@@ -107,35 +107,51 @@ def test_parse_realtime_steps_short_packet():
 
 
 def test_parse_raw_sensor_data_valid():
-    """Verify parsing of raw IMU 3-axis accelerometer packets."""
-    # type 0x01 (high freq ~25Hz, scale 256.0), seq 5
-    # sample 1: x = 0, y = 0, z = 256 (1.0g along z)
-    # sample 2: x = -128, y = 128, z = 0 (-0.5g along x, +0.5g along y)
-    payload = bytearray([0x01, 5])
-    payload += struct.pack("<hhh", 0, 0, 256)
-    payload += struct.pack("<hhh", -128, 128, 0)
+    """Verify parsing of a real-shaped accelerometer frame (type 0x00)."""
+    # type 0x00 (accelerometer), seq 5, 4096 LSB/g
+    # sample 1: (0, 2000, 3570) -> a ~1 g resting vector
+    # sample 2: (-2048, 0, 0)   -> -0.5 g along x
+    payload = bytearray([0x00, 5])
+    payload += struct.pack("<hhh", 0, 2000, 3570)
+    payload += struct.pack("<hhh", -2048, 0, 0)
 
     result = parse_raw_sensor_data(payload)
-    assert result["type"] == 0x01
+    assert result["type"] == 0x00
     assert result["sequence"] == 5
     assert result["sample_count"] == 2
 
     s0 = result["samples"][0]
     assert s0["x_raw"] == 0
-    assert s0["y_raw"] == 0
-    assert s0["z_raw"] == 256
-    assert s0["az_g"] == 1.0
+    assert s0["y_raw"] == 2000
+    assert s0["z_raw"] == 3570
+    assert s0["az_g"] == pytest.approx(3570 / 4096, abs=1e-4)
 
     s1 = result["samples"][1]
-    assert s1["ax_g"] == -0.5
-    assert s1["ay_g"] == 0.5
+    assert s1["ax_g"] == pytest.approx(-0.5)
+    assert s1["ay_g"] == 0.0
+
+
+def test_parse_raw_sensor_data_ignores_non_accel_frames():
+    """Optical (0x01) and status (0x07) frames carry no accelerometer samples."""
+    # 66-byte optical frame as captured from real hardware
+    optical = bytes([0x01, 0x01]) + bytes(64)
+    result = parse_raw_sensor_data(optical)
+    assert result["type"] == 0x01
+    assert result["sequence"] == 1
+    assert result["sample_count"] == 0
+    assert result["samples"] == []
+
+    status = bytes([0x07, 0x27, 0x00, 0xF0, 0x01, 0x71, 0x05, 0x00, 0x00, 0x00, 0x00])
+    result = parse_raw_sensor_data(status)
+    assert result["type"] == 0x07
+    assert result["samples"] == []
 
 
 def test_parse_raw_sensor_data_invalid():
     """Verify error checking on malformed raw sensor packets."""
     with pytest.raises(ValueError):
-        parse_raw_sensor_data(bytearray([0x01]))
+        parse_raw_sensor_data(bytearray([0x00]))
 
-    # Payload length not divisible by 6 (7 bytes total, 5 payload bytes)
+    # Accelerometer payload length not divisible by 6 (5 payload bytes)
     with pytest.raises(ValueError):
-        parse_raw_sensor_data(bytearray([0x01, 0x00, 1, 2, 3, 4, 5]))
+        parse_raw_sensor_data(bytearray([0x00, 0x00, 1, 2, 3, 4, 5]))

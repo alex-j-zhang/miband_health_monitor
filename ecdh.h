@@ -43,6 +43,15 @@
 /* for size-annotated integer types: uint8_t, uint32_t etc. */
 #include <stdint.h> 
 
+/* Export the public entry points when building a DLL with MSVC (the wrapper
+   passes -DECDH_BUILD_DLL).  MinGW/clang export all symbols by default and the
+   macro expands to nothing on non-Windows platforms. */
+#if defined(_WIN32) && defined(ECDH_BUILD_DLL)
+ #define ECDH_API __declspec(dllexport)
+#else
+ #define ECDH_API
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif /* __cplusplus */
@@ -91,10 +100,10 @@ extern "C" {
 
 
 /* NOTE: assumes private is filled with random data before calling */
-int ecdh_generate_keys(uint8_t* public_key, uint8_t* private_key);
+ECDH_API int ecdh_generate_keys(uint8_t* public_key, uint8_t* private_key);
 
 /* input: own private key + other party's public key, output: shared secret */
-int ecdh_shared_secret(const uint8_t* private_key, const uint8_t* others_pub, uint8_t* output);
+ECDH_API int ecdh_shared_secret(const uint8_t* private_key, const uint8_t* others_pub, uint8_t* output);
 
 
 /* Broken :( .... */

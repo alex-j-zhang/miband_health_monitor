@@ -1,5 +1,116 @@
-.env
-__pycache__/
-*.pyc
-.pytest_cache/
+# ============================================================================
+# Mi Band 6 Health Monitor — ignore rules
+#
+# Purpose: keep credentials and personal health data out of git.
+# Anything this project records about a real band (BLE address, auth key,
+# heart rate / SpO2 / activity samples, debug captures) must stay local.
+# ============================================================================
 
+# --- Secrets & credentials ---------------------------------------------------
+# Local runtime config holds the real DEVICE_MAC and AUTH_KEY. Never commit it.
+.env
+.env.*
+!.env.example
+*.env
+.envrc
+
+# Other secret material (keys, exports, token caches)
+secrets/
+private/
+*.pem
+*.key
+*.p12
+*.pfx
+*.kdbx
+*.ovpn
+auth_key.txt
+auth_key.json
+authkey.txt
+*token_cache*
+*token*.json
+*token*.txt
+*.token
+.huami_token/
+
+# --- Personal health / telemetry data ---------------------------------------
+# Runtime output of miband_client.py / history_report.py / export_csv.py.
+data/
+exports/
+*.jsonl
+*.csv
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+mi_band.db*
+
+# --- Debug captures & validation bundles ------------------------------------
+# These carry BLE addresses, raw payloads and real health readings.
+validation/
+payloads/
+captures/
+screenshots/
+*.btsnoop
+*.pcap
+*.pcapng
+*.cap
+history_*.bin
+history_*.json
+*.log
+logs/
+run.log
+*.tar.gz
+*.tgz
+
+# --- Python caches & test artifacts -----------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pytype/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+build/
+dist/
+*.egg-info/
+*.egg
+# Locally built native ECDH libraries (Linux libecdh.so is tracked on purpose)
+libecdh.dll
+libecdh.dylib
+*.dll
+*.dylib
+*.obj
+*.o
+*.lib
+.venv/
+venv/
+env/
+ENV/
+
+# --- Notebooks / editors / OS ----------------------------------------------
+.ipynb_checkpoints/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+*.orig
+*.rej
+
+# WorkBuddy local session memory (never commit)
+.workbuddy/

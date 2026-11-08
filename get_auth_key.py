@@ -14,7 +14,29 @@ from huami_token.xiaomi import XiaomiClient, XiaomiSession
 from huami_token.zepp import ZeppClient, ZeppSession
 
 ENV_PATH = Path(__file__).parent / ".env"
-TARGET_MAC = "C0:FF:EE:C0:FF:EE"
+
+try:  # optional convenience: pick up the configured band identifier from .env
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover
+    load_dotenv = None
+if load_dotenv is not None:
+    load_dotenv(ENV_PATH)
+
+# Never hard-code a real band MAC in the repository: prefer the configured one.
+# DEVICE_ID is the cross-platform name; DEVICE_MAC is the legacy alias.
+TARGET_MAC = (os.getenv("DEVICE_ID") or os.getenv("DEVICE_MAC") or "").strip().upper()
+
+
+def _preferred_device_env_key() -> str:
+    """Return the .env key to write the MAC to (DEVICE_ID when present)."""
+    try:
+        text = ENV_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return "DEVICE_MAC"
+    for line in text.splitlines():
+        if line.strip().startswith("DEVICE_ID="):
+            return "DEVICE_ID"
+    return "DEVICE_MAC"
 
 
 def update_env_file(key: str, value: str) -> None:
@@ -40,6 +62,11 @@ def update_env_file(key: str, value: str) -> None:
 
     with open(ENV_PATH, "w", encoding="utf-8") as f:
         f.writelines(new_lines)
+    # Credentials file: keep it readable only by the owner.
+    try:
+        os.chmod(ENV_PATH, 0o600)
+    except OSError:  # pragma: no cover - e.g. exotic filesystems
+        pass
 
 
 def run_extractor() -> int:
@@ -70,6 +97,7 @@ def run_extractor() -> int:
     try:
         found_key = None
         device_name = "Unknown"
+        target_mac = TARGET_MAC
 
         if method == "xiaomi":
             session = XiaomiSession(username=username, password=password)
@@ -96,9 +124,10 @@ def run_extractor() -> int:
                 print(f"  [{idx + 1}] {name} (MAC: {mac})")
                 if auth_key:
                     print(f"      Auth Key: {auth_key}")
-                    if mac == TARGET_MAC.upper() or not found_key:
+                    if (TARGET_MAC and mac == TARGET_MAC) or not found_key:
                         found_key = auth_key
                         device_name = name
+                        target_mac = mac
                 else:
                     print("      Auth Key: (Not present in record)")
 
@@ -118,16 +147,18 @@ def run_extractor() -> int:
                 print(f"  [{idx + 1}] Device {mac} | Active: {device.active}")
                 if auth_key:
                     print(f"      Auth Key: {auth_key}")
-                    if mac == TARGET_MAC.upper() or not found_key:
+                    if (TARGET_MAC and mac == TARGET_MAC) or not found_key:
                         found_key = auth_key
                         device_name = f"Device {mac}"
+                        target_mac = mac
 
         if found_key:
             print("\n" + "=" * 60)
             print(f"[+] Successfully extracted Auth Key for {device_name}!")
             print(f"[+] Key: {found_key}")
             update_env_file("AUTH_KEY", found_key)
-            update_env_file("DEVICE_MAC", TARGET_MAC)
+            if target_mac:
+                update_env_file(_preferred_device_env_key(), target_mac)
             print(f"[+] Successfully updated {ENV_PATH}")
             print("=" * 60)
             print("\nNext steps:")
@@ -147,5 +178,13 @@ def run_extractor() -> int:
 
 
 if __name__ == "__main__":
+    # Windows 重定向输出时，控制台代码页可能无法编码中文提示；替换而不是抛错。
+    for _stream in (sys.stdout, sys.stderr):
+        _reconfigure = getattr(_stream, "reconfigure", None)
+        if _reconfigure is not None:
+            try:
+                _reconfigure(errors="replace")
+            except (ValueError, OSError):  # pragma: no cover - defensive
+                pass
     sys.exit(run_extractor())
 
