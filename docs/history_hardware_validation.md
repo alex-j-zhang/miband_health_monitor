@@ -1,5 +1,8 @@
 # 真机验证清单：⑦ 实验性血氧（SpO₂）与手环历史数据读取
 
+> **数据脱敏说明**：文中日期均为占位日期（统一映射到 2020 年 1 月），仅用于区分夜次与相对顺序，不代表真实采集时间；所列数值为聚合统计，不含设备标识、账号或逐分钟原始样本。
+
+
 > 适用版本：包含 `band_history.py` 且 `--sync-history` 可用的版本（git ≥ `28080a9`）。
 > 涉及代码：[band_history.py](../band_history.py)、[miband_client.py](../miband_client.py)、
 > [docs/../tools/capture_history_payload.py](../tools/capture_history_payload.py)。
@@ -23,7 +26,7 @@
 
 ---
 
-## 0.1 验证结果（2026-11-08，Mi Band 6 / Windows WinRT / MTU 247）
+## 0.1 验证结果（2020-01-08，Mi Band 6 / Windows WinRT / MTU 247）
 
 **结论：活动数据与血氧都能真机取到，Q1–Q7、Q9 全部通过；Q8 部分通过。**
 两处与「仅模拟器验证」不同的行为已被修正进代码，并补了真机字节级回归用例。
@@ -36,11 +39,11 @@
 | 完成帧 | 本固件为 3 字节 `10 02 01`，**不带 CRC32** | 保留可选 CRC 校验分支，不带 CRC 时跳过 |
 | ACK 后数据 | 仍可按更早窗口再次取到同一批数据（窗口语义，非「ACK 即删除」） | 同步循环按分钟推进窗口，避免同一条记录重复写入 |
 
-实测数据（`--sync-history 2`）：1920 条活动记录，2026-11-06 22:03 → 11-08 14:02
+实测数据（`--sync-history 2`）：1920 条活动记录，2020-01-06 22:03 → 01-08 14:02
 （本地时间），零重复、时间单调，合计 10675 步；血氧 1 条（100%，非自动测量）。
 `--sync-history 1` 正确返回空并确认（`10 03 01`），不再异常。
 
-> 2026-11-08 补充：睡眠血氧 `0x26` 也已单独取证通过——12901 B / 430 条，
+> 2020-01-08 补充：睡眠血氧 `0x26` 也已单独取证通过——12901 B / 430 条，
 > 30B 布局与 SpO₂ 字段偏移确认，详见附录 A.1。
 
 ---
@@ -291,7 +294,7 @@ grep -E "Band history sync finished|no new history data" "$RUN2/run.log"
 - [x] **A12** 活动样本 8B：`kind,intensity,steps,heart_rate,unknown1,sleep,deep_sleep,rem_sleep`
       （字段可解，语义仅 `steps`/`heart_rate` 已确认）。
 - [x] **A13** 血氧记录 65B：`int32 LE unix_ts, int8 spo2(负=自动, 值+128), 60B 保留`；版本字节=2。
-      真机记录解出 100%（2026-11-07 07:42:07 本地）。
+      真机记录解出 100%（2020-01-07 07:42:07 本地）。
 - [x] **A14** 历史同步放在实时流之前不产生副作用（先同步再开流，心率/步数正常）。
 
 ---
@@ -404,11 +407,11 @@ sqlite 行数：spo2=   activity_history=
 | 类型码 | 活动 `0x01`、普通血氧 `0x25`、睡眠血氧 `0x26` |
 | 启动时间编码 | 6B 短日历（年 LE16/月/日/时/分）+ `0x00` + 时区（15min） |
 | 血氧 payload | 版本 `2` + N×65B |
-| 睡眠血氧 payload | 版本 `2` + N×30B（**2026-11-08 真机验证通过，见附录 A.1**）<br>`int32 LE ts` + `u8 spo2` + `u8 duration` + 6B high + 6B low + 8B signal + 4B spare |
+| 睡眠血氧 payload | 版本 `2` + N×30B（**2020-01-08 真机验证通过，见附录 A.1**）<br>`int32 LE ts` + `u8 spo2` + `u8 duration` + 6B high + 6B low + 8B signal + 4B spare |
 | 活动 payload | N×8B（Mi Band 6） |
 | 默认超时/轮数 | 30s / 5 轮 |
 
-### 附录 A.1：睡眠血氧 `0x26` 真机验证结果（2026-11-08，PASS）
+### 附录 A.1：睡眠血氧 `0x26` 真机验证结果（2020-01-08，PASS）
 
 ```bash
 python tools/capture_history_payload.py --days 7 --spo2-sleep \

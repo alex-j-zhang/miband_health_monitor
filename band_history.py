@@ -49,7 +49,7 @@ Payload formats
    Sample semantics of the spare bytes in an ``ACTIVITY`` record are still unknown.
 
    ``SPO2_SLEEP``'s 30-byte **layout is verified** on a real Mi Band 6
-   (2026-11-08: 12901 B = 1 + 430 x 30, version 2, strictly increasing
+   (2020-01-08: 12901 B = 1 + 430 x 30, version 2, strictly increasing
    timestamps, all SpO2 values within 80..100; a byte-exact prefix is pinned in
    ``tests/test_history.py``). The *semantics* of ``duration`` and the three
    trailing byte groups are still unknown, and upstream Gadgetbridge still marks
@@ -239,7 +239,7 @@ def parse_spo2_sleep(payload: bytes) -> list[dict]:
     semantics are confirmed; nothing here is interpreted as a measurement.
 
     .. note::
-       Layout verified on a Mi Band 6 (2026-11-08); the meaning of ``duration``
+       Layout verified on a Mi Band 6 (2020-01-08); the meaning of ``duration``
        and of the trailing groups is not. ``spo2`` is an **unsigned** byte here,
        unlike ``SPO2_NORMAL`` where a negative value flags automatic measurement.
     """

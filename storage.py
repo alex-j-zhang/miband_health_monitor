@@ -290,7 +290,7 @@ class TelemetryStore:
     ) -> None:
         """Persist one sleep-SpO2 (0x26) record to its own table and JSONL.
 
-        The 30-byte layout was verified on a Mi Band 6 (2026-11-08), but
+        The 30-byte layout was verified on a Mi Band 6 (2020-01-08), but
         ``duration`` and the trailing byte groups have no confirmed meaning,
         so rows go to the dedicated ``spo2_sleep`` table -- never the point
         measurement ``spo2`` table. Both sinks receive the record according

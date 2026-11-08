@@ -111,3 +111,6 @@ desktop.ini
 *~
 *.orig
 *.rej
+
+# WorkBuddy local session memory (never commit)
+.workbuddy/

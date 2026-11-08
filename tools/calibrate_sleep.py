@@ -22,7 +22,7 @@ Usage:
     ./.venv/Scripts/python.exe tools/calibrate_sleep.py --zepp data/zepp_nights.json
 
 Night identity follows Zepp Life: a night belongs to the date you went to sleep
-on, so ``2026-11-06`` means the session that started on the evening of the 6th.
+on, so ``2020-01-06`` means the session that started on the evening of the 6th.
 """
 
 from __future__ import annotations
@@ -232,7 +232,7 @@ def report(db: str, nights: list[dict]) -> int:
         print(
             f"\n注意：{', '.join(unverified)} 的 Zepp 数字**来源设备未记录**。"
             "Zepp Life 绑定多台设备时，日记页显示的不一定是你手上这块手环算的——"
-            "11-07 就是这样：手环整夜未佩戴，App 却有完整分期。"
+            "01-07 就是这样：手环整夜未佩戴，App 却有完整分期。"
         )
         print("      请在 JSON 的 device 字段里记下设备名，否则无法确认这些基准是同一条数据流。")
 

@@ -106,7 +106,7 @@ def test_a_motionless_stretch_does_not_split_the_night():
     """45 quiet minutes are still sleep -- only movement ends a night.
 
     A ``kind``-based split used to break the night here, which is how the old
-    model lost the first 53 minutes of the real 11-06 night.
+    model lost the first 53 minutes of the real night A.
     """
     samples = series(30) + series(45, start=30, kind=80, hr=70) + series(30, start=75)
     sessions = detect_sessions(samples)
@@ -353,7 +353,7 @@ def test_cli_says_not_worn_instead_of_inventing_a_night(tmp_path, capsys):
 
 
 # ---------------------------------------------------------------------------
-# The Zepp Life calibration (2026-11-06: score 73, 8 h 40 m asleep,
+# The Zepp Life calibration (night A: score 73, 8 h 40 m asleep,
 # 44 min deep = 8 %, 20 min awake)
 # ---------------------------------------------------------------------------
 def test_awake_is_counted_by_steps_not_intensity():
@@ -387,10 +387,11 @@ def test_a_lone_anchor_minute_cannot_create_a_night():
 
 
 def test_real_capture_reproduces_the_zepp_night():
-    """Regression on the actual 2026-11-06 capture, if it is present.
+    """Regression on a local capture, if one is present (no capture is committed).
 
-    We never synced 21:06-22:06, so the app's 540-minute window is compared on
-    the overlap: in bed ~480, asleep ~460, awake ~20, deep ~44 (8 %).
+    The exact date is deliberately not pinned: it belongs to local, ignored
+    data. We compare the overlap of the app's 540-minute window instead:
+    in bed ~480, asleep ~460, awake ~20, deep ~44 (8 %).
     """
     from pathlib import Path
 
@@ -401,7 +402,7 @@ def test_real_capture_reproduces_the_zepp_night():
     result = analyze(load_samples(db))
     assert len(result["sessions"]) == 1
     night = result["sessions"][0]
-    assert night["start"] == "2026-11-06T22:06"
+    assert len(night["start"]) == 16 and night["start"][10] == "T"
     assert 440 <= night["minutes_in_bed"] <= 500
     assert 430 <= night["minutes_asleep"] <= 480
     assert 10 <= night["stage_minutes"]["awake"] <= 25
@@ -411,9 +412,9 @@ def test_real_capture_reproduces_the_zepp_night():
 
 
 # ---------------------------------------------------------------------------
-# The 2026-11-07 night: Zepp shows 23% REM, the band shows nothing at all
+# Night B: Zepp shows 23% REM, the band shows nothing at all
 # ---------------------------------------------------------------------------
-def test_the_zepp_11_07_night_cannot_have_come_from_this_band():
+def test_zepp_night_b_cannot_have_come_from_this_band():
     """A night the app reports as 6 h 27 m with 87 min REM is a negative control.
 
     Zepp's window is 22:44 -> 05:11. The band recorded every minute of it as
@@ -442,7 +443,7 @@ def test_the_worn_night_scores_every_sleep_minute():
     """On the night the band *was* worn, the score bytes are lit almost always.
 
     That is the other half of the inversion: the app reports **0** REM minutes
-    for 11-06 while the byte is nonzero on 458 of its 485 minutes.
+    for night A while the byte is nonzero on 458 of its 485 minutes.
     """
     from pathlib import Path
 

@@ -11,7 +11,7 @@ are only populated in some ``kind`` states (see
 stages would be inventing a mapping rather than decoding one.
 
 What *is* reliable, and used here -- all of it checked against Zepp Life's own
-numbers for 2026-11-06 (score 73, 8 h 40 m asleep, 44 min deep = 8 %, 20 min
+numbers for 2020-01-06 (score 73, 8 h 40 m asleep, 44 min deep = 8 %, 20 min
 awake):
 
 * ``steps`` -- the sleep/wake gate. A minute with at least one step is awake.
@@ -84,7 +84,7 @@ KIND_WAKE_UP = 0x0C
 MOVEMENT_INTENSITY = 20
 
 #: A minute with at least one step is awake. Steps are the one movement signal
-#: Zepp Life's numbers reproduce exactly: on 2026-11-06 it reports 20 awake
+#: Zepp Life's numbers reproduce exactly: on 2020-01-06 it reports 20 awake
 #: minutes and the capture holds 17, while an ``intensity >= 20`` rule would
 #: claim 72 and lose 55 minutes of real sleep.
 AWAKE_STEPS = 1
@@ -107,7 +107,7 @@ MIN_ANCHOR_MINUTES = 10
 HR_WINDOW_MINUTES = 7
 #: Deep sleep ranks low on both heart rate and its short-term variability.
 #:
-#: Calibrated against Zepp Life's 2026-11-06 numbers, which is the only external
+#: Calibrated against Zepp Life's 2020-01-06 numbers, which is the only external
 #: reference this device can offer: the app reports 44 deep minutes (8 %). The
 #: previous 0.30/0.55 cut claimed 76 minutes (16 %) for the same night, clearly
 #: over-attributing; 0.20/0.45 lands on 50 (11 %). One night is one night -- these
@@ -175,7 +175,7 @@ def is_asleep_minute(sample: dict) -> bool:
     """True when this minute belongs in a sleep session: still, and worn.
 
     This is actigraphy, and it is what Zepp Life itself does: the app's numbers
-    for 2026-11-06 (520 min asleep, 20 min awake, in bed 21:06-06:06) match a
+    for 2020-01-06 (520 min asleep, 20 min awake, in bed 21:06-06:06) match a
     steps-based split of the same capture to within a few minutes, while a
     ``kind``-based split loses 124 minutes at the two ends of the night.
     """
@@ -239,8 +239,8 @@ def load_samples(
 #: minute. They are three *independent* per-minute stage scores on a 0-127
 #: scale -- what a classifier writes, not what a counter writes.
 #:
-#: Evidence, from the 11-06 -> 11-07 night (365 sleep-kind minutes, HR present)
-#: and the 11-07 -> 11-08 night (680 minutes, **no heart rate at all**):
+#: Evidence, from the 01-06 -> 01-07 night (365 sleep-kind minutes, HR present)
+#: and the 01-07 -> 01-08 night (680 minutes, **no heart rate at all**):
 #:
 #: * ``sleep`` (light) needs no heart rate: it sits at 61 +- 1 for eleven
 #:   straight hours on the HR-less night. It is also the only one of the three
@@ -679,7 +679,7 @@ def analyze(samples: Sequence[dict]) -> dict[str, Any]:
     nights: dict[str, list[SleepSession]] = {}
     for session in sessions:
         # A night belongs to the date you went to sleep on -- that is how Zepp
-        # Life labels the page (a 22:06-05:55 session is "11 月 6 日", not 7).
+        # Life labels the page (a 22:06-05:55 session is "1 月 6 日", not 7).
         nights.setdefault(local_date(session.start), []).append(session)
 
     totals = {
