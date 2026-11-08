@@ -34,7 +34,7 @@ jobs:
         run: python -c "import ecdh_wrapper as e; a=e.generate_ecdh_keys(); b=e.generate_ecdh_keys(); assert e.compute_shared_secret(a[0], b[1]) == e.compute_shared_secret(b[0], a[1]); print('ECDH backend:', e.backend_name())"
 
       - name: Demo smoke test (no hardware)
-        run: python miband_client.py --demo 2 --imu --output data/ci-demo --storage both --export-csv
+        run: python miband_client.py --demo 2 --imu --sync-history 1 --sync-sleep-spo2 --output data/ci-demo --storage both --export-csv
 
       - name: Verify demo artifacts
         shell: bash
@@ -42,4 +42,7 @@ jobs:
           test -s data/ci-demo/heart_rate.jsonl
           test -s data/ci-demo/steps.jsonl
           test -s data/ci-demo/imu.jsonl
+          test -s data/ci-demo/spo2_sleep.jsonl
           test -s data/ci-demo/csv/heart_rate.csv
+          test -s data/ci-demo/csv/spo2.csv
+          test -s data/ci-demo/csv/spo2_sleep.csv
