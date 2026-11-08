@@ -18,7 +18,7 @@ macOS/CoreBluetooth），因此不需要为每个系统维护一套蓝牙代码�
 | 设备标识 | 蓝牙 MAC | 蓝牙 MAC | **CoreBluetooth UUID**（不暴露 MAC） |
 | 名称匹配 `DEVICE_NAME` | 支持 | 支持 | 支持（推荐） |
 | ECDH 后端 | 原生 `libecdh.so`（自动编译） | 纯 Python（可选手动放 `libecdh.dll`） | 纯 Python（可选手动编译 `.dylib`） |
-| 状态 | 已长期使用 | **待真机验证** | 代码兼容，待验证 |
+| 状态 | 已验证（软件链路 + 真机，需先配对） | **待真机验证** | 代码兼容，待验证 |
 
 ECDH 后端选择规则（`ecdh_wrapper.py`）：
 
@@ -55,18 +55,45 @@ cd miband_health_monitor
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 
+# 环境自检：适配器 / 配对状态 / ECDH 后端 / .env 权限，一次看全
+.venv/bin/python miband_client.py --doctor
+
 # 无硬件：单元测试 + 全链路 demo
 .venv/bin/python -m pytest -q
 .venv/bin/python miband_client.py --demo 2 --imu --output data/demo --export-csv
 ```
 
-### 2.3 真机
+### 2.3 真机（**首次必须先配对**）
+
+Linux/BlueZ 与 Windows 不同：系统不会在连接时自动完成配对。**未配对时手环会在
+连接后约 40 秒主动断开**，日志表现为
+`UnknownObject: Method "WriteValue" ... doesn't exist`。
 
 ```bash
-cp .env.example .env        # 填 DEVICE_ID（MAC）与 AUTH_KEY
-.venv/bin/python scan_ble.py            # 确认手环广播、拿到 MAC
+# 0) 自检，确认适配器 powered / pairable
+.venv/bin/python miband_client.py --doctor
+
+# 1) 让适配器可配对（只需一次；重启后可能需要重设）
+bluetoothctl pairable on
+
+# 2) 找到手环并配对 + 信任（bluetoothctl 会自动注册配对 agent）
+bluetoothctl scan on            # 点亮并滑动屏幕，直到出现 Mi Smart Band
+bluetoothctl pair  AA:BB:CC:DD:EE:FF
+bluetoothctl trust AA:BB:CC:DD:EE:FF
+bluetoothctl scan off
+
+# 3) 填配置并运行
+cp .env.example .env            # 填 DEVICE_ID（MAC）与 AUTH_KEY
+.venv/bin/python scan_ble.py    # 可选：确认广播、核对 MAC
 .venv/bin/python miband_client.py 60 --log-level DEBUG
 ```
+
+配对并 trust 之后：
+
+- 连接不再依赖"恰好扫到广播"——程序会优先用 BlueZ 里已配对的设备对象**直接连接**
+  （`--no-direct-connect` 可强制回到扫描路径）；
+- BlueZ 会在手环重新出现时主动回连；
+- ATT MTU 会显式协商（此前恒为 23 字节）。
 
 ### 2.4 常见问题
 
@@ -75,6 +102,19 @@ cp .env.example .env        # 填 DEVICE_ID（MAC）与 AUTH_KEY
 | `org.bluez was not provided` / `No Bluetooth adapters found` | `bluetooth` 服务未运行或无适配器；WSL2 不支持蓝牙，请用原生 Linux |
 | 扫描不到 | 手机蓝牙关闭；点亮并滑动屏幕；`bluetoothctl scan on` 交叉确认 |
 | 权限不足 | 普通用户通常可用；若受限，检查 polkit/`bluetooth` 组或使用桌面会话 |
+| 连上 40 秒左右就断，日志 `UnknownObject ... doesn't exist` | **未配对**。按 §2.3 执行 `bluetoothctl pair` + `trust` |
+| 连接时 BlueZ 日志出现 `No agent available for request type 2` | 同上：没有配对 agent。用 `bluetoothctl` 交互式命令配对，或先运行桌面蓝牙面板 |
+| 启动日志 `MTU=23` 并伴随 `Using default MTU value` 警告 | 旧版本行为；当前版本会主动协商。若仍出现，加 `--log-level DEBUG` 查看 `_acquire_mtu` 失败原因 |
+| 每次都要等几十秒才连上 | 确认已 `pair`/`trust`（可直连）；或调大 `--scan-timeout`、保持手环屏幕唤醒 |
+
+### 2.5 Linux 专属行为说明
+
+| 行为 | 说明 |
+|---|---|
+| 直连优先 | 已配对设备从 BlueZ 对象树直接连接，跳过扫描；失败自动回退扫描 |
+| `--no-direct-connect` | 强制走扫描路径，便于排查"直连拿到的是旧对象"这类问题 |
+| MTU 协商 | 连接后调用 bleak 的 `_acquire_mtu()`；WinRT 由系统自动完成 |
+| 配对状态 | `Paired: yes` 才能稳定长连；`Trusted: yes` 让 BlueZ 主动回连 |
 
 ---
 
@@ -103,7 +143,8 @@ py -3 -m venv .venv
 .venv\Scripts\python.exe miband_client.py --demo 2 --imu --output data\demo --export-csv
 ```
 
-预期：`88 passed`；demo 生成 `data\demo\*.jsonl`、`mi_band.db` 与 `csv\`。
+预期：全部通过（当前 `241 passed, 4 skipped`，跳过项需要真实抓包数据）；
+demo 生成 `data\demo\*.jsonl`、`mi_band.db` 与 `csv\`。
 这两步通过说明 Python、依赖、ECDH 纯 Python 后端、存储、看板、导出链路在
 Windows 上都正常，剩下的只有真实 BLE 链路。
 

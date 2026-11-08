@@ -27,7 +27,7 @@
 | CSV 导出 | 从 SQLite 导出 5 张 CSV 表 |
 | 自动重连 | 会话失败/链路丢失后指数退避重连；心率保活失败也会触发重连 |
 | 无硬件演示 | `--demo` 使用内置模拟手环跑通完整链路（认证、数据流、历史同步、落盘、导出） |
-| 测试 | 202 个单元/集成测试，含模拟 BLE 后端，**不需要真实手环**；CI 覆盖 Linux/Windows/macOS |
+| 测试 | 241 个单元/集成测试，含模拟 BLE 后端，**不需要真实手环**；CI 覆盖 Linux/Windows/macOS |
 
 ---
 
@@ -240,6 +240,9 @@ cp .env.example .env
 Linux / macOS（虚拟环境内）：
 
 ```bash
+# 环境自检：适配器、配对状态、ECDH 后端、.env 权限
+.venv/bin/python miband_client.py --doctor
+
 # 无硬件先跑通全链路（模拟手环，2 秒，含 IMU 与 CSV 导出）
 .venv/bin/python miband_client.py --demo 2 --imu --output data/demo --export-csv
 

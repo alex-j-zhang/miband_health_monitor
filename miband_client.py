@@ -44,6 +44,7 @@ from dotenv import load_dotenv
 
 from bleak import BleakClient, BleakScanner
 
+import bluez_support
 from band_history import sync_history, summarize_history_result
 from dashboard import DashboardServer, TelemetryHub, make_db_history_provider
 from ecdh_wrapper import backend_name as ecdh_backend_name
@@ -72,6 +73,11 @@ CHUNKED_DEFAULT_MTU = 23
 CHUNKED_FIRST_HEADER_SIZE = 11
 CHUNKED_NEXT_HEADER_SIZE = 5
 CHUNKED_ATT_OVERHEAD = 3
+
+#: Upper bound for the Linux "connect the bonded device without scanning"
+#: attempt.  A sleeping / out-of-range band must not stall startup, so a failed
+#: direct attempt falls back to discovery quickly.
+DIRECT_CONNECT_TIMEOUT = 12.0
 
 # The band's step-1 auth payload is always 16-byte challenge + 48-byte pubkey.
 AUTH_STEP1_RANDOM_SIZE = 16
@@ -407,6 +413,7 @@ class MiBand6Client:
         scan_timeout: float = 90.0,
         connect_timeout: float = 25.0,
         auth_timeout: float = 30.0,
+        direct_connect: bool = True,
     ) -> None:
         self.device_id = (device_id or "").strip()
         # Optional case-insensitive advertised-name match; works on platforms
@@ -420,6 +427,8 @@ class MiBand6Client:
         self.scan_timeout = scan_timeout
         self.connect_timeout = connect_timeout
         self.auth_timeout = auth_timeout
+        # Linux only: try the band's already-bonded BlueZ object before scanning.
+        self._direct_connect = bool(direct_connect)
         self._session_mtu: Optional[int] = None
 
         self.client: Optional[BleakClient] = None
@@ -471,6 +480,31 @@ class MiBand6Client:
         return self.device_id
 
     # ---------------------------------------------------------------- discovery
+    async def _direct_connect_target(self):
+        """Return a directly connectable ``BLEDevice`` for a bonded band.
+
+        On Linux a paired device keeps a BlueZ object path even while it is not
+        advertising, so ``BleakClient`` can connect without a discovery pass.
+        Injected factories (tests) and non-BlueZ platforms always scan, which
+        keeps this fast path out of the simulated and Windows/macOS code paths.
+        """
+        if not self._direct_connect:
+            return None
+        if self._client_factory is not BleakClient:
+            return None
+        if not bluez_support.is_bluez_platform():
+            return None
+        if not bluez_support.looks_like_mac(self.device_id):
+            return None
+
+        device = await bluez_support.paired_device(self.device_id)
+        if device is not None:
+            logger.info(
+                "Bonded band %s found in the BlueZ object tree; skipping discovery.",
+                self.device_id,
+            )
+        return device
+
     async def _discover_device(self, scan_timeout: float):
         found_device = None
         stop_event = asyncio.Event()
@@ -516,6 +550,71 @@ class MiBand6Client:
             )
 
     # ------------------------------------------------------------ connection
+    async def _open_client(self, direct_device, scan_timeout: float, connect_timeout: float) -> None:
+        """Connect to *direct_device*, or scan and connect when it is ``None``.
+
+        A direct connection to a bonded BlueZ device skips discovery, but the
+        cached object can still be stale (bond removed, adapter reset), so a
+        failed direct attempt always falls back to the scanning path.
+        """
+
+        def _new_client(device, timeout: float):
+            return self._client_factory(
+                device,
+                timeout=timeout,
+                disconnected_callback=self._on_disconnected,
+            )
+
+        found_device = direct_device
+        if found_device is None:
+            logger.info(
+                "Waiting for Mi Band broadcast at %s (touch/light up band screen)...",
+                self._describe_target(),
+            )
+            found_device = await self._discover_device(scan_timeout)
+            logger.info("Band detected! Establishing BLE link (keep screen awake)...")
+
+        # A fresh client object per session avoids stale D-Bus device handles.
+        # The direct attempt gets a shorter budget so a sleeping band cannot
+        # delay the fallback scan by the full connect timeout.
+        direct_timeout = min(connect_timeout, DIRECT_CONNECT_TIMEOUT)
+        self.client = _new_client(
+            found_device, connect_timeout if direct_device is None else direct_timeout
+        )
+        try:
+            await self.client.connect()
+        except Exception as exc:
+            if direct_device is None:
+                raise
+            logger.warning(
+                "Direct connection to the bonded device failed (%s); "
+                "falling back to a scan...",
+                bluez_support.describe_ble_error(exc),
+            )
+            with contextlib.suppress(Exception):
+                await self.client.disconnect()
+            self.client = None
+            found_device = await self._discover_device(scan_timeout)
+            logger.info("Band detected! Establishing BLE link (keep screen awake)...")
+            self.client = _new_client(found_device, connect_timeout)
+            await self.client.connect()
+
+    async def _apply_mtu(self) -> None:
+        """Resolve the ATT MTU once, asking BlueZ for it explicitly first."""
+        # BlueZ reports 23 bytes (and warns) until the backend is asked for the
+        # real ATT MTU; WinRT and CoreBluetooth fill it in during connect.  Do
+        # this before the first chunked write so the framing is sized once.
+        acquired = False
+        if self.mtu is None:
+            acquired = await bluez_support.try_acquire_mtu(self.client)
+        self._session_mtu = _resolve_mtu(self.client, self.mtu)
+        logger.info(
+            "BLE link established. Initializing chunked transfer listener (MTU=%d)...",
+            self._session_mtu,
+        )
+        if acquired:
+            logger.info("Negotiated ATT MTU via BlueZ: %d bytes.", self._session_mtu)
+
     async def connect_and_authenticate(
         self,
         scan_timeout: Optional[float] = None,
@@ -531,28 +630,9 @@ class MiBand6Client:
         self._disconnected.clear()
         self._prv_key, self._pub_key = generate_ecdh_keys()
 
-        logger.info(
-            "Waiting for Mi Band broadcast at %s (touch/light up band screen)...",
-            self._describe_target(),
-        )
-        found_device = await self._discover_device(scan_timeout)
-        logger.info("Band detected! Establishing BLE link (keep screen awake)...")
-
-        # A fresh client object per session avoids stale D-Bus device handles.
-        self.client = self._client_factory(
-            found_device,
-            timeout=connect_timeout,
-            disconnected_callback=self._on_disconnected,
-        )
-        await self.client.connect()
-        # Resolve the ATT MTU once per session so the chunked writes use a
-        # consistent payload size (and so backends that can only report it
-        # lazily, like BlueZ, are only queried once).
-        self._session_mtu = _resolve_mtu(self.client, self.mtu)
-        logger.info(
-            "BLE link established. Initializing chunked transfer listener (MTU=%d)...",
-            self._session_mtu,
-        )
+        direct_device = await self._direct_connect_target()
+        await self._open_client(direct_device, scan_timeout, connect_timeout)
+        await self._apply_mtu()
 
         await self.client.start_notify(UUID_CHAR_CHUNKED_READ, self._on_chunked_notification)
 
@@ -857,7 +937,10 @@ class MiBand6Client:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.error("Heart-rate keep-alive failed; treating link as lost: %s", exc)
+            logger.error(
+                "Heart-rate keep-alive failed; treating link as lost: %s",
+                bluez_support.describe_ble_error(exc),
+            )
             self._disconnected.set()
 
     async def stop_heart_rate_stream(self) -> None:
@@ -1000,6 +1083,7 @@ async def run_monitor(
     sync_sleep_spo2: bool = False,
     device_name: Optional[str] = None,
     mtu: Optional[int] = None,
+    direct_connect: bool = True,
     client_factory: Optional[Callable[[str, str], MiBand6Client]] = None,
 ) -> None:
     """Connect + stream until *duration* elapses, reconnecting with backoff."""
@@ -1011,6 +1095,7 @@ async def run_monitor(
             device_name=device_name,
             mtu=mtu,
             scan_timeout=scan_timeout,
+            direct_connect=direct_connect,
         )
     )
     deadline = None if duration is None else time.monotonic() + duration
@@ -1065,7 +1150,7 @@ async def run_monitor(
             raise
         except Exception as exc:
             failure = exc
-            logger.error("Session %d failed: %s", attempt, exc)
+            logger.error("Session %d failed: %s", attempt, bluez_support.describe_ble_error(exc))
         finally:
             await client.disconnect()
 
@@ -1287,6 +1372,19 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="do not automatically reconnect after errors or link loss",
     )
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="run an environment self-check and exit (never connects to the band)",
+    )
+    parser.add_argument(
+        "--no-direct-connect",
+        action="store_true",
+        help=(
+            "always scan for the band instead of using the bonded BlueZ device "
+            "(Linux only; direct connect is the default when the band is paired)"
+        ),
+    )
     args = parser.parse_args(argv)
     if args.sync_sleep_spo2 and args.sync_history is None:
         parser.error("--sync-sleep-spo2 requires --sync-history [DAYS]")
@@ -1298,6 +1396,17 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 async def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
     _configure_logging(args.log_level)
+
+    if args.doctor:
+        # Imported lazily: doctor imports this module for config validation.
+        from doctor import run_doctor
+
+        return await run_doctor(
+            (args.device_id or "").strip(),
+            (os.getenv("AUTH_KEY") or "").strip(),
+            args.output,
+        )
+
     logger.info("ECDH backend: %s", ecdh_backend_name())
 
     device_id = (args.device_id or "").strip()
@@ -1446,6 +1555,7 @@ async def main(argv: Optional[list[str]] = None) -> int:
                 sync_sleep_spo2=args.sync_sleep_spo2,
                 device_name=device_name,
                 mtu=args.mtu,
+                direct_connect=not args.no_direct_connect,
             )
     except KeyboardInterrupt:
         logger.info("Stopping on user request...")
