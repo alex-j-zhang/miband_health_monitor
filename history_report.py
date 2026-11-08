@@ -99,8 +99,13 @@ def summarize(db_path: str | Path, hours: float = 24.0, now: float | None = None
             }
 
         if _table_exists(conn, "activity_history"):
+            # 0 means "no measurement this minute"; 255 (0xFF) is the band's
+            # "heart rate unavailable" sentinel and must not be averaged in --
+            # on real 2-day data it is present in ~37% of the samples and pushed
+            # the reported average from 71 to 172 BPM.
             count, total_steps, avg_hr = conn.execute(
-                "SELECT COUNT(*), SUM(steps), AVG(NULLIF(heart_rate, 0)) "
+                "SELECT COUNT(*), SUM(steps), "
+                "AVG(CASE WHEN heart_rate BETWEEN 30 AND 220 THEN heart_rate END) "
                 "FROM activity_history WHERE ts >= ?",
                 (since,),
             ).fetchone()

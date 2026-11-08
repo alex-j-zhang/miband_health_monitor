@@ -8,22 +8,26 @@ import pytest
 from band_history import (
     ACTIVITY_SAMPLE_SIZE,
     SPO2_RECORD_SIZE,
+    SPO2_SLEEP_RECORD_SIZE,
     BandHistoryFetcher,
     FetchDataType,
     HistoryFetchError,
     HistoryParseError,
+    HistorySyncResult,
+    _trim_to_records,
     decode_fetch_time,
     decode_short_calendar,
     encode_fetch_time,
     encode_short_calendar,
     parse_activity,
     parse_spo2_normal,
+    parse_spo2_sleep,
     summarize_history_result,
     sync_history,
 )
 from history_report import format_report, summarize
 from miband_client import parse_args
-from sim_band import SimulatedBand, make_simulated_client
+from sim_band import SimulatedBand, _spo2_sleep_record, make_simulated_client
 from storage import TelemetryStore, read_jsonl
 
 MAC = "C0:FF:EE:C0:FF:EE"
@@ -122,14 +126,172 @@ async def test_simulated_activity_fetch_roundtrip():
 
 
 async def test_simulated_fetch_rejects_unsupported_type():
+    """0x26 is supported now; use a type this client genuinely does not handle."""
     band = SimulatedBand(auth_key=AUTH_KEY_BYTES)
     client = await _connected_client(band)
     try:
         fetcher = BandHistoryFetcher(client, timeout=2.0)
         with pytest.raises(HistoryFetchError, match="rejected"):
-            await fetcher.fetch_payload(FetchDataType.SPO2_SLEEP, datetime.now())
+            await fetcher.fetch_payload(0x2C, datetime.now())  # STATISTICS upstream
     finally:
         await client.disconnect()
+
+
+async def test_simulated_spo2_sleep_fetch_roundtrip():
+    band = SimulatedBand(auth_key=AUTH_KEY_BYTES)
+    client = await _connected_client(band)
+    try:
+        fetcher = BandHistoryFetcher(client, timeout=3.0)
+        since = datetime.now() - timedelta(hours=2)
+        payload, _start_ts = await fetcher.fetch_payload(FetchDataType.SPO2_SLEEP, since)
+        samples = parse_spo2_sleep(payload)
+        assert len(samples) == len(band.history_spo2_sleep)
+        assert [s["spo2"] for s in samples] == [s["spo2"] for s in band.history_spo2_sleep]
+    finally:
+        await client.disconnect()
+
+
+async def test_sync_history_spo2_sleep_is_opt_in():
+    """Default sync must never request 0x26; the opt-in path delivers samples."""
+    band = SimulatedBand(auth_key=AUTH_KEY_BYTES)
+    client = await _connected_client(band)
+    try:
+        baseline = await sync_history(client, days=1, timeout=3.0, max_rounds=1)
+        assert baseline.spo2_sleep == []
+        assert "spo2_sleep" not in baseline.rounds
+
+        seen: list[dict] = []
+        result = await sync_history(
+            client,
+            days=1,
+            include_spo2_sleep=True,
+            on_spo2_sleep=seen.append,
+            timeout=3.0,
+            max_rounds=1,
+        )
+        assert len(result.spo2_sleep) == len(band.history_spo2_sleep)
+        assert seen == result.spo2_sleep
+        assert "spo2_sleep" in result.rounds
+    finally:
+        await client.disconnect()
+
+
+async def test_simulated_empty_fetch_keeps_requested_window():
+    """A "nothing new" answer must not blow up on the epoch start timestamp.
+
+    Real hardware replies to an empty fetch with ``10 01 01 00 00 00 00`` plus a
+    1970-01-01 calendar; converting that on Windows raised ``OSError [Errno 22]``
+    while only logging, so the whole sync aborted with no usable payload.
+    """
+    band = SimulatedBand(auth_key=AUTH_KEY_BYTES)
+    band.history_spo2.clear()
+    client = await _connected_client(band)
+    try:
+        fetcher = BandHistoryFetcher(client, timeout=3.0)
+        since = (datetime.now() - timedelta(hours=2)).replace(microsecond=0)
+        payload, start_ts = await fetcher.fetch_payload(FetchDataType.SPO2_NORMAL, since)
+        assert payload == b""
+        assert start_ts == pytest.approx(since.timestamp())
+    finally:
+        await client.disconnect()
+
+
+def test_parse_spo2_normal_real_hardware_payload():
+    """Decode a byte-exact SpO2 payload captured from a Mi Band 6."""
+    tokens = (
+        "02 cf 65 ee 6a 64 43 00 00 00 19 00 4e d6 ee 6a 0c be 08 00 4e d6 ee 6a"
+    ).split()
+    raw = bytes(int(token, 16) for token in tokens) + b"\x00" * 25 + b"\x01" + b"\x00" * 16
+    assert len(raw) == 1 + SPO2_RECORD_SIZE
+
+    samples = parse_spo2_normal(raw)
+    assert samples == [
+        {"ts": 1794008527.0, "spo2": 100, "auto_measure": False},
+    ]
+
+
+def test_parse_spo2_sleep_keeps_the_30_byte_layout():
+    """0x26 has its own record size -- sharing the 65-byte normal layout is a bug."""
+    assert SPO2_SLEEP_RECORD_SIZE == 30
+    record = (
+        _spo2_sleep_record(1794008527, 97, 60)[:6]
+        + bytes(range(1, 7))       # spo2_high
+        + bytes(range(7, 13))      # spo2_low
+        + bytes(range(13, 21))     # signal_quality
+        + bytes(range(21, 25))     # extend
+    )
+    assert len(record) == 30
+    payload = b"\x02" + record + _spo2_sleep_record(1794008587, 95, 30)
+
+    samples = parse_spo2_sleep(payload)
+    assert len(samples) == 2
+    assert samples[0] == {
+        "ts": 1794008527.0,
+        "spo2": 97,
+        "duration": 60,
+        "spo2_high": [1, 2, 3, 4, 5, 6],
+        "spo2_low": [7, 8, 9, 10, 11, 12],
+        "signal_quality": [13, 14, 15, 16, 17, 18, 19, 20],
+        "extend": [21, 22, 23, 24],
+        "source": "sleep",
+    }
+    assert samples[1]["spo2"] == 95
+    assert samples[1]["ts"] == 1794008587.0
+
+
+def test_parse_spo2_sleep_real_hardware_prefix():
+    """Byte-exact prefix captured from a Mi Band 6 on 2026-11-08.
+
+    The full payload was 12901 B = 1 version byte + 430 x 30 B, spanning
+    21:39 -> 05:39 local time. These are its first two records. Pinning real
+    bytes matters: the simulator builds records with the same assumptions as
+    the parser, so it can only ever prove self-consistency.
+    """
+    raw = bytes.fromhex(
+        "02aed8ed6a6420646464640000636464640000010300001200000000391300"
+        "ead8ed6a6440646464646464636364646464010000002d00000000391300"
+    )
+    assert len(raw) == 1 + 2 * SPO2_SLEEP_RECORD_SIZE
+
+    samples = parse_spo2_sleep(raw)
+    assert len(samples) == 2
+    assert samples[0]["spo2"] == 100
+    assert samples[0]["duration"] == 32
+    assert samples[0]["spo2_high"] == [100, 100, 100, 100, 0, 0]
+    assert samples[0]["spo2_low"] == [99, 100, 100, 100, 0, 0]
+    assert samples[0]["signal_quality"] == [1, 3, 0, 0, 18, 0, 0, 0]
+    assert samples[0]["extend"] == [0, 57, 19, 0]
+    assert samples[1]["spo2"] == 100
+    assert samples[1]["duration"] == 64
+    assert samples[1]["ts"] - samples[0]["ts"] == 60
+
+
+def test_parse_spo2_sleep_rejects_bad_payloads():
+    assert parse_spo2_sleep(b"") == []
+    with pytest.raises(HistoryParseError, match="version"):
+        parse_spo2_sleep(b"\x03" + b"\x00" * SPO2_SLEEP_RECORD_SIZE)
+    with pytest.raises(HistoryParseError, match="multiple of 30"):
+        parse_spo2_sleep(b"\x02" + b"\x00" * 29)
+
+
+def test_trim_to_records_uses_the_sleep_record_size():
+    """A padded final chunk must be trimmed at 30 bytes, not 65."""
+    payload = b"\x02" + _spo2_sleep_record(1794008527, 98, 60) + b"\xaa" * 7
+    trimmed = _trim_to_records(FetchDataType.SPO2_SLEEP, payload)
+    assert len(trimmed) == 1 + SPO2_SLEEP_RECORD_SIZE
+    assert len(parse_spo2_sleep(trimmed)) == 1
+
+    normal = b"\x02" + b"\x11" * SPO2_RECORD_SIZE + b"\xbb" * 3
+    assert len(_trim_to_records(FetchDataType.SPO2_NORMAL, normal)) == 1 + SPO2_RECORD_SIZE
+
+
+def test_summarize_marks_sleep_spo2_as_experimental():
+    default = HistorySyncResult()
+    assert "sleep SpO2" not in summarize_history_result(default)
+
+    enabled = HistorySyncResult(spo2_sleep=[{"ts": 1.0, "spo2": 97}])
+    summary = summarize_history_result(enabled)
+    assert "1 sleep SpO2 sample(s) [experimental]" in summary
 
 
 async def test_simulated_fetch_detects_packet_loss():
@@ -270,6 +432,37 @@ async def test_history_report_summarizes_database(tmp_path):
     assert "heart rate" in report
 
 
+def test_activity_average_ignores_unavailable_heart_rate(tmp_path):
+    """255 is the band's "measurement unavailable" sentinel, not a BPM value.
+
+    Real 2-day data carries it in roughly a third of the minutes; averaging it
+    in reported 172 BPM where the true average was 71.
+    """
+    def sample(heart_rate: int, steps: int = 0) -> dict:
+        return {
+            "kind": 1,
+            "intensity": 5,
+            "steps": steps,
+            "heart_rate": heart_rate,
+            "unknown1": 0,
+            "sleep": 0,
+            "deep_sleep": 0,
+            "rem_sleep": 0,
+        }
+
+    store = TelemetryStore(tmp_path, backend="sqlite")
+    try:
+        for heart_rate in (60, 80, 255, 255, 0):
+            store.record_activity_history(sample(heart_rate))
+    finally:
+        store.close()
+
+    summary = summarize(tmp_path / "mi_band.db", hours=48)
+    activity = summary["tables"]["activity_history"]
+    assert activity["minutes"] == 5
+    assert activity["avg_heart_rate"] == 70.0
+
+
 def test_history_report_missing_database(tmp_path):
     with pytest.raises(FileNotFoundError):
         summarize(tmp_path / "missing.db")
@@ -285,3 +478,35 @@ def test_cli_sync_history_argument():
     assert args.sync_history == 3
     args = parse_args(["--demo", "1"])
     assert args.sync_history is None
+
+
+async def test_fetcher_built_before_connect_still_finds_the_link():
+    """A fetcher may be constructed before the wrapper owns its BLE client.
+
+    ``MiBand6Client.client`` is ``None`` until ``connect_and_authenticate()``
+    finishes, so resolving once in ``__init__`` would keep the wrapper and fail
+    later with ``AttributeError: 'MiBand6Client' object has no attribute
+    'start_notify'`` -- which is exactly what the first hardware probe of the
+    ``0x48`` sleep-session type hit.
+    """
+    band = SimulatedBand(auth_key=AUTH_KEY_BYTES)
+    client = await _connected_client(band)
+    try:
+        fetcher = BandHistoryFetcher(client, timeout=3.0)
+        # Simulate the ordering: hand the fetcher the wrapper, then connect.
+        fetcher.client = client
+        assert not hasattr(fetcher.client, "start_notify")
+        payload, _ = await fetcher.fetch_payload(FetchDataType.ACTIVITY, datetime.now() - timedelta(hours=2))
+        assert payload
+        assert hasattr(fetcher.client, "start_notify")
+    finally:
+        await client.disconnect()
+
+
+async def test_fetcher_refuses_to_fetch_without_a_link():
+    class NotConnected:
+        client = None
+
+    fetcher = BandHistoryFetcher(NotConnected(), timeout=1.0)
+    with pytest.raises(HistoryFetchError, match="not connected"):
+        await fetcher._open()

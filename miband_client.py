@@ -45,7 +45,7 @@ from dotenv import load_dotenv
 from bleak import BleakClient, BleakScanner
 
 from band_history import sync_history, summarize_history_result
-from dashboard import DashboardServer, TelemetryHub
+from dashboard import DashboardServer, TelemetryHub, make_db_history_provider
 from ecdh_wrapper import backend_name as ecdh_backend_name
 from ecdh_wrapper import compute_shared_secret, generate_ecdh_keys
 from export_csv import export_database
@@ -85,6 +85,17 @@ CMD_RAW_SENSOR_START_1 = b"\x01\x03\x19"  # 25 Hz sampling rate
 CMD_RAW_SENSOR_START_2 = b"\x01\x03\x00\x00\x00\x19"
 CMD_RAW_SENSOR_START_3 = b"\x02"
 CMD_RAW_SENSOR_STOP = b"\x03"
+
+# Characteristic 0x0002 multiplexes several sensor streams, each prefixed with a
+# one-byte frame type.  Verified against a real Mi Band 6: only ``0x00`` frames
+# carry the 3-axis accelerometer, ``0x01`` looks like an optical (PPG) channel
+# and ``0x07`` is a short periodic status frame.
+RAW_SENSOR_TYPE_ACCEL = 0x00
+RAW_SENSOR_TYPE_OPTICAL = 0x01
+RAW_SENSOR_TYPE_STATUS = 0x07
+#: Accelerometer full scale on the Mi Band 6 is +/-8 g at 4096 LSB/g
+#: (resting magnitude measures 0.997 g, which pins the scale down).
+RAW_SENSOR_ACCEL_LSB_PER_G = 4096.0
 
 DEMO_DEFAULT_MAC = "C0:FF:EE:C0:FF:EE"
 DEMO_DEFAULT_AUTH_KEY = "0123456789abcdef0123456789abcdef"
@@ -151,23 +162,44 @@ def parse_realtime_steps(data: bytearray | bytes) -> dict:
 
 
 def parse_raw_sensor_data(data: bytearray | bytes) -> dict:
-    """Parse raw 3-axis accelerometer/IMU samples from characteristic 0x0002.
+    """Parse one notification from the raw-sensor characteristic (``0x0002``).
 
-    Byte 0: sensor frame type (0x00: 1Hz low-freq, 0x01: ~25Hz high-freq)
-    Byte 1: sequence counter (0-255 rolling index)
-    Bytes 2..end: 6-byte triplets (signed int16 x, y, z in little-endian)
+    The band multiplexes several streams on this characteristic, each prefixed
+    with a one-byte frame type and a rolling sequence counter:
+
+    * ``0x00`` – 3-axis accelerometer, 17-18 samples per frame at ~25 Hz;
+    * ``0x01`` – optical (PPG) channel, not accelerometer data;
+    * ``0x07`` – short periodic status frame.
+
+    Accelerometer frames are laid out as::
+
+        byte 0     frame type (0x00)
+        byte 1     sequence counter (0-255 rolling)
+        bytes 2..  6-byte triplets: signed int16 LE x, y, z at 4096 LSB/g
+
+    Frames of any other type are returned with an empty ``samples`` list so
+    callers can ignore them instead of treating them as parse failures.
     """
     if len(data) < 2:
         raise ValueError(f"Raw sensor payload too short: {len(data)} bytes")
 
     sensor_type = data[0]
     seq_index = data[1]
+
+    if sensor_type != RAW_SENSOR_TYPE_ACCEL:
+        return {
+            "type": sensor_type,
+            "sequence": seq_index,
+            "sample_count": 0,
+            "samples": [],
+        }
+
     payload = data[2:]
 
     if len(payload) % 6 != 0:
         raise ValueError(f"Sensor payload length ({len(payload)}) not divisible by 6")
 
-    scale_factor = 4100.0 if sensor_type == 0x00 else 256.0
+    scale_factor = RAW_SENSOR_ACCEL_LSB_PER_G
     gravity = 9.80665
 
     samples = []
@@ -357,6 +389,7 @@ class StreamCallbacks:
     imu: Optional[Callable[[dict], None]] = None
     history_spo2: Optional[Callable[[dict], None]] = None
     history_activity: Optional[Callable[[dict], None]] = None
+    history_spo2_sleep: Optional[Callable[[dict], None]] = None
 
 
 class MiBand6Client:
@@ -404,6 +437,8 @@ class MiBand6Client:
         self._hr_active = False
         self._steps_active = False
         self._sensor_active = False
+        #: Frame types seen on 0x0002 that are not accelerometer data (logged once).
+        self._ignored_sensor_types: set[int] = set()
 
         # Chunked auth reassembly state (reset per connection).
         self._prv_key = b""
@@ -532,15 +567,34 @@ class MiBand6Client:
             mtu=self._session_mtu,
         )
 
+        # A link drop during the handshake must not leave the session waiting
+        # for the full auth timeout: watch the disconnect signal alongside the
+        # auth result so the supervisor can reconnect promptly.  This matters
+        # most with the slower pure-Python ECDH backend.
+        auth_wait = asyncio.create_task(self._auth_event.wait())
+        link_wait = asyncio.create_task(self._disconnected.wait())
         try:
-            await asyncio.wait_for(self._auth_event.wait(), timeout=auth_timeout)
-        except asyncio.TimeoutError:
-            raise TimeoutError(
-                f"Chunked ECDH authentication timed out after {auth_timeout:.0f}s"
-            ) from None
+            await asyncio.wait(
+                {auth_wait, link_wait},
+                timeout=auth_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in (auth_wait, link_wait):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(auth_wait, link_wait, return_exceptions=True)
 
         if self._auth_error:
             raise RuntimeError(f"Authentication failed: {self._auth_error}")
+        if not self._auth_event.is_set():
+            if self._disconnected.is_set():
+                raise ConnectionError(
+                    "BLE link lost during chunked ECDH authentication"
+                )
+            raise TimeoutError(
+                f"Chunked ECDH authentication timed out after {auth_timeout:.0f}s"
+            )
 
         self.authenticated = True
         logger.info("Chunked ECDH authentication SUCCEEDED. Session is ready.")
@@ -749,16 +803,27 @@ class MiBand6Client:
     def _on_sensor_notification(self, _sender, data: bytearray) -> None:
         try:
             sensor_info = parse_raw_sensor_data(data)
-            if sensor_info["samples"]:
-                first = sensor_info["samples"][0]
-                logger.debug(
-                    "[IMU] Seq %d, %d samples, accel: (%.2fg, %.2fg, %.2fg)",
-                    sensor_info["sequence"],
-                    sensor_info["sample_count"],
-                    first["ax_g"],
-                    first["ay_g"],
-                    first["az_g"],
-                )
+            if not sensor_info["samples"]:
+                # Non-accelerometer frame sharing characteristic 0x0002
+                # (optical/status); ignore quietly instead of logging an error.
+                if sensor_info["type"] not in self._ignored_sensor_types:
+                    self._ignored_sensor_types.add(sensor_info["type"])
+                    logger.debug(
+                        "Ignoring non-accelerometer raw-sensor frames of type 0x%02x "
+                        "(length %d)",
+                        sensor_info["type"],
+                        len(data),
+                    )
+                return
+            first = sensor_info["samples"][0]
+            logger.debug(
+                "[IMU] Seq %d, %d samples, accel: (%.2fg, %.2fg, %.2fg)",
+                sensor_info["sequence"],
+                sensor_info["sample_count"],
+                first["ax_g"],
+                first["ay_g"],
+                first["az_g"],
+            )
             if self._sensor_callback:
                 self._sensor_callback(sensor_info)
         except Exception as exc:
@@ -892,15 +957,25 @@ async def _sync_band_history(
     client: MiBand6Client,
     days: int,
     callbacks: StreamCallbacks,
+    *,
+    include_spo2_sleep: bool = False,
 ) -> None:
     """Fetch band-side history once; failures never abort live streaming."""
     logger.info("Fetching up to %d day(s) of band-side history (experimental)...", days)
+    if include_spo2_sleep:
+        logger.warning(
+            "Sleep SpO2 (0x26) capture enabled: 30B layout verified on Mi Band 6, "
+            "but trailing field semantics are unknown; samples go to the "
+            "dedicated spo2_sleep table + JSONL, never the point spo2 table."
+        )
     try:
         result = await sync_history(
             client,
             days=days,
             on_spo2=callbacks.history_spo2,
             on_activity=callbacks.history_activity,
+            include_spo2_sleep=include_spo2_sleep,
+            on_spo2_sleep=callbacks.history_spo2_sleep,
         )
     except Exception as exc:
         logger.error("Band history sync failed (continuing with live streams): %s", exc)
@@ -922,6 +997,7 @@ async def run_monitor(
     reconnect_initial_delay: float = 1.0,
     reconnect_max_delay: float = 30.0,
     sync_history_days: Optional[int] = None,
+    sync_sleep_spo2: bool = False,
     device_name: Optional[str] = None,
     mtu: Optional[int] = None,
     client_factory: Optional[Callable[[str, str], MiBand6Client]] = None,
@@ -952,11 +1028,20 @@ async def run_monitor(
         try:
             await client.connect_and_authenticate(scan_timeout=scan_timeout)
             if sync_history_days is not None:
-                await _sync_band_history(client, sync_history_days, callbacks)
-            await client.start_heart_rate_stream(callbacks.heart_rate)
-            await client.start_steps_stream(callbacks.steps)
+                await _sync_band_history(
+                    client,
+                    sync_history_days,
+                    callbacks,
+                    include_spo2_sleep=sync_sleep_spo2,
+                )
+            # Order matters on real hardware: the raw sensor hub stream must be
+            # activated *before* the heart-rate stream.  Starting it afterwards
+            # silently starves the standard BLE heart-rate characteristic
+            # (measured on a Mi Band 6: 0 HR notifications in 20 s vs ~1/s).
             if imu:
                 await client.start_raw_sensor_stream(callbacks.imu)
+            await client.start_heart_rate_stream(callbacks.heart_rate)
+            await client.start_steps_stream(callbacks.steps)
             logger.info(
                 "Streaming session %d started (duration=%s, imu=%s).",
                 attempt,
@@ -1011,6 +1096,7 @@ async def run_demo(
     imu: bool = False,
     callbacks: Optional[StreamCallbacks] = None,
     sync_history_days: Optional[int] = None,
+    sync_sleep_spo2: bool = False,
     mtu: Optional[int] = None,
 ) -> None:
     """Run the full client stack against the in-memory simulator (no hardware)."""
@@ -1043,6 +1129,7 @@ async def run_demo(
         reconnect_initial_delay=0.2,
         reconnect_max_delay=1.0,
         sync_history_days=sync_history_days,
+        sync_sleep_spo2=sync_sleep_spo2,
         mtu=mtu,
         client_factory=_factory,
     )
@@ -1144,6 +1231,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--sync-sleep-spo2",
+        action="store_true",
+        help=(
+            "also fetch experimental sleep SpO2 (type 0x26) for payload capture; "
+            "requires --sync-history; 30B layout verified, trailing fields unknown, "
+            "samples are written to spo2_sleep.jsonl only"
+        ),
+    )
+    parser.add_argument(
         "--demo",
         action="store_true",
         help="run against the in-memory simulated band (no Bluetooth hardware)",
@@ -1192,6 +1288,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="do not automatically reconnect after errors or link loss",
     )
     args = parser.parse_args(argv)
+    if args.sync_sleep_spo2 and args.sync_history is None:
+        parser.error("--sync-sleep-spo2 requires --sync-history [DAYS]")
     if args.storage not in STORAGE_BACKENDS:
         args.storage = "both"
     return args
@@ -1252,7 +1350,12 @@ async def main(argv: Optional[list[str]] = None) -> int:
     if args.web_port is not None:
         hub = TelemetryHub()
         hub.attach_loop(asyncio.get_running_loop())
-        web_server = DashboardServer(hub, host=args.web_host, port=args.web_port)
+        web_server = DashboardServer(
+            hub,
+            host=args.web_host,
+            port=args.web_port,
+            history_provider=make_db_history_provider(store.db_path),
+        )
         try:
             await web_server.start()
             logger.info("Live dashboard: %s", web_server.url)
@@ -1297,12 +1400,16 @@ async def main(argv: Optional[list[str]] = None) -> int:
     def _on_history_activity(sample: dict) -> None:
         store.record_activity_history(sample, timestamp=sample.get("ts"))
 
+    def _on_history_spo2_sleep(sample: dict) -> None:
+        store.record_spo2_sleep(sample)
+
     callbacks = StreamCallbacks(
         heart_rate=_on_heart_rate,
         steps=_on_steps,
         imu=_on_imu,
         history_spo2=_on_history_spo2,
         history_activity=_on_history_activity,
+        history_spo2_sleep=_on_history_spo2_sleep,
     )
     if args.storage == "none":
         logger.info("Storage disabled; telemetry will only be logged.")
@@ -1323,6 +1430,7 @@ async def main(argv: Optional[list[str]] = None) -> int:
                 imu=args.imu,
                 callbacks=callbacks,
                 sync_history_days=args.sync_history,
+                sync_sleep_spo2=args.sync_sleep_spo2,
                 mtu=args.mtu,
             )
         else:
@@ -1335,6 +1443,7 @@ async def main(argv: Optional[list[str]] = None) -> int:
                 scan_timeout=args.scan_timeout,
                 reconnect=not args.no_reconnect,
                 sync_history_days=args.sync_history,
+                sync_sleep_spo2=args.sync_sleep_spo2,
                 device_name=device_name,
                 mtu=args.mtu,
             )

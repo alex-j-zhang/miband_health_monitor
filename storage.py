@@ -44,6 +44,9 @@ JSONL_FILENAMES = {
     "imu": "imu.jsonl",
     "spo2": "spo2.jsonl",
     "activity_history": "activity_history.jsonl",
+    # Sleep SpO2 (type 0x26): its own JSONL and its own SQLite table, never
+    # mixed with the point-measurement ``spo2`` stream.
+    "spo2_sleep": "spo2_sleep.jsonl",
 }
 
 DB_FILENAME = "mi_band.db"
@@ -109,8 +112,25 @@ CREATE TABLE IF NOT EXISTS activity_history (
     rem_sleep INTEGER NOT NULL DEFAULT 0
 );
 
+-- Sleep SpO2 (fetch type 0x26) lives in its OWN table: it is a dense
+-- night-long stream, not a point measurement, and must never be mixed with
+-- ``spo2``. The four trailing byte groups stay as JSON text because their
+-- semantics are still unconfirmed (see band_history module docstring).
+CREATE TABLE IF NOT EXISTS spo2_sleep (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    iso_time TEXT NOT NULL,
+    spo2 INTEGER NOT NULL,
+    duration INTEGER NOT NULL DEFAULT 0,
+    spo2_high TEXT NOT NULL DEFAULT '[]',
+    spo2_low TEXT NOT NULL DEFAULT '[]',
+    signal_quality TEXT NOT NULL DEFAULT '[]',
+    extend TEXT NOT NULL DEFAULT '[]'
+);
+
 CREATE INDEX IF NOT EXISTS idx_spo2_ts ON spo2(ts);
 CREATE INDEX IF NOT EXISTS idx_activity_history_ts ON activity_history(ts);
+CREATE INDEX IF NOT EXISTS idx_spo2_sleep_ts ON spo2_sleep(ts);
 """
 
 _INSERT_SQL = {
@@ -131,6 +151,10 @@ _INSERT_SQL = {
         "INSERT INTO activity_history (ts, iso_time, kind, intensity, steps, "
         "heart_rate, unknown1, sleep, deep_sleep, rem_sleep) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ),
+    "spo2_sleep": (
+        "INSERT INTO spo2_sleep (ts, iso_time, spo2, duration, spo2_high, "
+        "spo2_low, signal_quality, extend) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
     ),
 }
 
@@ -177,6 +201,7 @@ class TelemetryStore:
             "imu": 0,
             "spo2": 0,
             "activity_history": 0,
+            "spo2_sleep": 0,
         }
         self._dropped = 0
         self._thread: Optional[threading.Thread] = None
@@ -257,6 +282,31 @@ class TelemetryStore:
                 "sleep": int(sample.get("sleep", 0)),
                 "deep_sleep": int(sample.get("deep_sleep", 0)),
                 "rem_sleep": int(sample.get("rem_sleep", 0)),
+            },
+        )
+
+    def record_spo2_sleep(
+        self, sample: dict, timestamp: Optional[float] = None
+    ) -> None:
+        """Persist one sleep-SpO2 (0x26) record to its own table and JSONL.
+
+        The 30-byte layout was verified on a Mi Band 6 (2026-11-08), but
+        ``duration`` and the trailing byte groups have no confirmed meaning,
+        so rows go to the dedicated ``spo2_sleep`` table -- never the point
+        measurement ``spo2`` table. Both sinks receive the record according
+        to the configured backend.
+        """
+        self._enqueue(
+            "spo2_sleep",
+            timestamp if timestamp is not None else sample.get("ts"),
+            {
+                "spo2": int(sample.get("spo2", 0)),
+                "duration": int(sample.get("duration", 0)),
+                "spo2_high": list(sample.get("spo2_high", [])),
+                "spo2_low": list(sample.get("spo2_low", [])),
+                "signal_quality": list(sample.get("signal_quality", [])),
+                "extend": list(sample.get("extend", [])),
+                "source": "sleep",
             },
         )
 
@@ -430,6 +480,20 @@ class TelemetryStore:
                     payload["sleep"],
                     payload["deep_sleep"],
                     payload["rem_sleep"],
+                ),
+            )
+        elif kind == "spo2_sleep":
+            conn.execute(
+                _INSERT_SQL[kind],
+                (
+                    event_ts,
+                    iso_time,
+                    payload["spo2"],
+                    payload["duration"],
+                    json.dumps(payload["spo2_high"]),
+                    json.dumps(payload["spo2_low"]),
+                    json.dumps(payload["signal_quality"]),
+                    json.dumps(payload["extend"]),
                 ),
             )
         else:  # pragma: no cover - guarded by callers

@@ -49,6 +49,17 @@ TABLE_COLUMNS = {
         "deep_sleep",
         "rem_sleep",
     ],
+    "spo2_sleep": [
+        "id",
+        "ts",
+        "iso_time",
+        "spo2",
+        "duration",
+        "spo2_high",
+        "spo2_low",
+        "signal_quality",
+        "extend",
+    ],
 }
 
 DEFAULT_DB = Path("data") / "mi_band.db"

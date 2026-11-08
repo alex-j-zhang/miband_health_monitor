@@ -7,9 +7,11 @@ stream subscription, persistence) and need no Bluetooth hardware.
 import asyncio
 import json
 import sqlite3
+import time
 
 import pytest
 
+from ecdh_wrapper import backend_name as ecdh_backend_name
 from export_csv import export_database
 from miband_client import (
     MiBand6Client,
@@ -95,9 +97,12 @@ async def test_simulated_heart_rate_steps_and_imu_streams():
 
 
 async def test_run_monitor_reconnects_after_link_loss(tmp_path):
-    # Drop the link 0.12 s after each connect: after the handshake and at least
-    # one heart-rate notification, so reconnects are exercised with real data.
-    band = SimulatedBand(auth_key=AUTH_KEY_BYTES, disconnect_after=0.12)
+    # Drop the link after the handshake and at least one heart-rate
+    # notification, so reconnects are exercised with real data.  The pure-Python
+    # ECDH backend needs a wider window (~0.3 s for the handshake) than the
+    # native one, otherwise the band disconnects before authentication finishes.
+    disconnect_after = 0.12 if ecdh_backend_name() == "native" else 0.5
+    band = SimulatedBand(auth_key=AUTH_KEY_BYTES, disconnect_after=disconnect_after)
     sim_client_factory, _ = simulated_factories(band)
     scanner_class = _make_scanner(MAC)
 
@@ -135,6 +140,32 @@ async def test_run_monitor_reconnects_after_link_loss(tmp_path):
     finally:
         conn.close()
     assert heart_rate_rows >= 1
+
+
+async def test_auth_wait_aborts_when_link_drops():
+    """A link drop mid-handshake must fail fast, not wait for auth_timeout."""
+    # Dropping the first auth control packet leaves the handshake pending, so
+    # only the disconnect watchdog can end the wait.
+    band = SimulatedBand(auth_key=AUTH_KEY_BYTES, drop_auth_seqs=(0,))
+    client = make_simulated_client(MAC, AUTH_KEY, band, scanner_address=MAC)
+
+    async def drop_link() -> None:
+        await asyncio.sleep(0.1)
+        client._on_disconnected(None)  # simulate the bleak disconnect callback
+
+    drop_task = asyncio.create_task(drop_link())
+    started = time.monotonic()
+    try:
+        with pytest.raises(ConnectionError, match="link lost"):
+            await client.connect_and_authenticate(scan_timeout=2.0, auth_timeout=5.0)
+    finally:
+        if not drop_task.done():
+            drop_task.cancel()
+        await asyncio.gather(drop_task, return_exceptions=True)
+        await client.disconnect()
+
+    assert time.monotonic() - started < 2.0, "auth wait did not abort on disconnect"
+    assert client.authenticated is False
 
 
 async def test_run_monitor_retries_after_authentication_failure(tmp_path):
@@ -237,6 +268,7 @@ async def test_demo_end_to_end_writes_jsonl_and_sqlite(tmp_path):
         "imu",
         "spo2",
         "activity_history",
+        "spo2_sleep",
     }
     for table, (path, rows) in exported.items():
         assert path.exists(), table

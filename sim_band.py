@@ -101,6 +101,7 @@ class SimulatedBand:
         disconnect_after: Optional[float] = None,
         history_spo2: Optional[list[dict]] = None,
         history_activity: Optional[list[dict]] = None,
+        history_spo2_sleep: Optional[list[dict]] = None,
         drop_history_packets: tuple[int, ...] = (),
     ) -> None:
         if len(auth_key) != 16:
@@ -123,8 +124,12 @@ class SimulatedBand:
             list(imu_packets)
             if imu_packets is not None
             else [
-                _imu_packet(sequence=0, samples=[(0, 0, 256), (0, 0, 250)]),
-                _imu_packet(sequence=1, samples=[(16, -8, 248)]),
+                _imu_packet(sequence=0, samples=[(0, 2000, 3570), (16, -8, 4088)]),
+                _imu_packet(sequence=1, samples=[(-120, 1990, 3580)]),
+                # Real bands interleave non-accelerometer frames (optical/status)
+                # on the same characteristic; the client must ignore them.
+                _optical_packet(sequence=0),
+                _status_packet(),
             ]
         )
 
@@ -146,6 +151,17 @@ class SimulatedBand:
                 _activity_sample(now - 180, steps=30, heart_rate=74),
                 _activity_sample(now - 120, steps=8, heart_rate=72),
                 _activity_sample(now - 60, steps=21, heart_rate=76),
+            ]
+        )
+        # Type 0x26 uses a 30-byte record (Gadgetbridge FetchSpo2SleepOperation).
+        # Kept separate so the opt-in path can be exercised without touching the
+        # normal SpO2 fixture data.
+        self.history_spo2_sleep = (
+            list(history_spo2_sleep)
+            if history_spo2_sleep is not None
+            else [
+                {"ts": now - 480, "spo2": 98, "duration": 60},
+                {"ts": now - 240, "spo2": 96, "duration": 60},
             ]
         )
         self.drop_history_packets = set(drop_history_packets)
@@ -284,10 +300,16 @@ class SimulatedBand:
                 )
                 return
             self._fetch_payload = payload
+            # Real hardware echoes the requested window when there is data, but
+            # answers with the epoch calendar (1970-01-01) when the fetch is
+            # empty -- reproduced here so the "nothing new" path is exercised.
+            echoed = (
+                datetime.fromtimestamp(start_timestamp) if payload else datetime(1970, 1, 1)
+            )
             metadata = (
                 bytes([RESPONSE, COMMAND_START_DATE, SUCCESS])
                 + len(payload).to_bytes(4, "little")
-                + encode_fetch_time(datetime.fromtimestamp(start_timestamp))
+                + encode_fetch_time(echoed)
             )
             self._emit_later(UUID_CHAR_FETCH, metadata, 0.001)
             return
@@ -343,6 +365,19 @@ class SimulatedBand:
                 payload += struct.pack("<i", int(sample["ts"]))
                 payload += struct.pack("<b", raw)
                 payload += b"\x00" * 60
+            return bytes(payload), float(min(s["ts"] for s in samples))
+
+        if fetch_type == FetchDataType.SPO2_SLEEP:
+            samples = [s for s in self.history_spo2_sleep if float(s["ts"]) >= since_ts]
+            if not samples:
+                return b"", since_ts
+            payload = bytearray([0x02])  # payload version
+            for sample in sorted(samples, key=lambda s: s["ts"]):
+                payload += _spo2_sleep_record(
+                    int(sample["ts"]),
+                    int(sample["spo2"]),
+                    int(sample.get("duration", 60)),
+                )
             return bytes(payload), float(min(s["ts"] for s in samples))
 
         if fetch_type == FetchDataType.ACTIVITY:
@@ -701,9 +736,44 @@ def _activity_sample(
     }
 
 
+def _spo2_sleep_record(timestamp: int, spo2: int, duration: int) -> bytes:
+    """One 30-byte sleep-SpO2 record (Gadgetbridge FetchSpo2SleepOperation).
+
+    4B ts + 1B spo2 + 1B duration + 6B high + 6B low + 8B signal + 4B spare.
+    The trailing groups carry no known semantics yet, so the simulator leaves
+    them zeroed; the parser must preserve them verbatim.
+    """
+    return (
+        struct.pack("<i", timestamp)
+        + bytes([spo2 & 0xFF, duration & 0xFF])
+        + b"\x00" * 6
+        + b"\x00" * 6
+        + b"\x00" * 8
+        + b"\x00" * 4
+    )
+
+
 def _imu_packet(sequence: int, samples: list[tuple[int, int, int]]) -> bytes:
-    packet = bytearray([0x01, sequence & 0xFF])
+    """Build an accelerometer frame shaped like a real Mi Band 6 one.
+
+    Type byte 0x00, rolling sequence, then signed int16 LE triplets at
+    4096 LSB/g (so (0, 2000, 3570) is a ~1 g resting vector).
+    """
+    packet = bytearray([0x00, sequence & 0xFF])
     for x, y, z in samples:
         for value in (x, y, z):
             packet.extend(int(value).to_bytes(2, "little", signed=True))
     return bytes(packet)
+
+
+def _optical_packet(sequence: int, samples: int = 32) -> bytes:
+    """Build a non-accelerometer (0x01) frame as seen on real hardware."""
+    packet = bytearray([0x01, sequence & 0xFF])
+    for index in range(samples):
+        packet.extend((25000 + (index * 37) % 900).to_bytes(2, "little"))
+    return bytes(packet)
+
+
+def _status_packet() -> bytes:
+    """Build the short 0x07 status frame real bands emit a few times a second."""
+    return bytes([0x07, 0x27, 0x00, 0xF0, 0x01, 0x71, 0x05, 0x00, 0x00, 0x00, 0x00])

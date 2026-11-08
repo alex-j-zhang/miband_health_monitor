@@ -182,10 +182,14 @@ def test_export_csv_roundtrip(tmp_path):
         "imu",
         "spo2",
         "activity_history",
+        "spo2_sleep",
     }
     assert exported["heart_rate"][1] == 2
     assert exported["imu"][1] == 2
     assert exported["spo2"][1] == 0
+    # The dedicated sleep-SpO2 table is created eagerly but stays empty until
+    # --sync-sleep-spo2 is used; it must still be exported.
+    assert exported["spo2_sleep"][1] == 0
 
     with open(tmp_path / "csv" / "heart_rate.csv", newline="", encoding="utf-8") as handle:
         rows = list(csv.reader(handle))
@@ -195,6 +199,38 @@ def test_export_csv_roundtrip(tmp_path):
     with open(tmp_path / "csv" / "imu.csv", newline="", encoding="utf-8") as handle:
         imu_rows = list(csv.reader(handle))
     assert len(imu_rows) == 3
+
+
+def test_spo2_sleep_lands_in_its_own_table(tmp_path):
+    """0x26 is a night-long stream: it must never leak into point ``spo2``."""
+    with TelemetryStore(tmp_path, backend="sqlite") as store:
+        store.record_spo2_sleep(
+            {
+                "ts": 1000.0,
+                "spo2": 94,
+                "duration": 32,
+                "spo2_high": [100, 100, 0, 0, 0, 0],
+                "spo2_low": [99, 100, 0, 0, 0, 0],
+                "signal_quality": [1, 3, 0, 0, 18, 0, 0, 0],
+                "extend": [0, 57, 19, 0],
+            }
+        )
+
+    conn = sqlite3.connect(tmp_path / "mi_band.db")
+    try:
+        row = conn.execute(
+            "SELECT ts, spo2, duration, spo2_high, spo2_low, signal_quality, extend "
+            "FROM spo2_sleep"
+        ).fetchone()
+        point_rows = conn.execute("SELECT COUNT(*) FROM spo2").fetchone()[0]
+    finally:
+        conn.close()
+    assert row == (
+        1000.0, 94, 32,
+        "[100, 100, 0, 0, 0, 0]", "[99, 100, 0, 0, 0, 0]",
+        "[1, 3, 0, 0, 18, 0, 0, 0]", "[0, 57, 19, 0]",
+    )
+    assert point_rows == 0
 
 
 def test_export_missing_database_raises(tmp_path):
