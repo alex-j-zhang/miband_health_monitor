@@ -9,13 +9,16 @@ Endpoints
 ---------
 ``GET /``                 self-contained dashboard page (``dashboard.html``)
 ``GET /api/snapshot``     latest values + recent series + counters (JSON)
-``GET /api/history``      one series: ``?kind=heart_rate&limit=600`` (JSON)
+``GET /api/history``      one series: ``?kind=heart_rate&limit=600`` (JSON);
+                          add ``source=db`` to read SQLite history instead
 ``GET /events``           Server-Sent Events stream of live samples
 ``GET /healthz``          liveness probe (JSON)
 
 The hub is safe to feed from BLE notification callbacks: it only appends to
 in-memory ring buffers and fans out to subscriber queues; slow subscribers are
-dropped rather than blocking the BLE event loop.
+dropped rather than blocking the BLE event loop. When a ``history_provider`` is
+supplied, ``source=db`` serves persisted rows in the same record shape so the
+page survives a refresh instead of starting from an empty chart.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ import asyncio
 import json
 import logging
 import math
+import sqlite3
 import time
 from collections import deque
 from http import HTTPStatus
@@ -40,6 +44,69 @@ DEFAULT_MAX_POINTS = 7200
 DEFAULT_SNAPSHOT_POINTS = 600
 SSE_QUEUE_SIZE = 512
 SSE_KEEPALIVE_SECONDS = 15.0
+
+#: Columns read from each SQLite table. Table names come from this fixed map
+#: (never from the request), so the query cannot be injected via ``kind``.
+_DB_HISTORY_COLUMNS: Dict[str, str] = {
+    "heart_rate": "ts, iso_time, bpm",
+    "steps": "ts, iso_time, steps, distance_m, calories",
+    "imu": "ts, iso_time, ax_g, ay_g, az_g",
+    "spo2": "ts, iso_time, spo2, auto_measure",
+}
+
+
+def make_db_history_provider(db_path: str | Path) -> Callable[[str, int], list[dict]]:
+    """Build a ``DashboardServer.history_provider`` backed by the SQLite sink.
+
+    Rows are reshaped into exactly the records ``TelemetryHub.publish_*`` emits,
+    so the browser can merge persisted and live series without special cases.
+    The database is opened per request (WAL permits concurrent readers); a
+    missing file or table yields an empty series rather than an error, which
+    keeps ``--storage jsonl|none`` and a fresh install working.
+    """
+    path = Path(db_path)
+
+    def provider(kind: str, limit: int) -> list[dict]:
+        if kind not in _DB_HISTORY_COLUMNS:
+            raise ValueError(f"unknown metric kind: {kind!r}")
+        if not path.is_file():
+            return []
+        conn = sqlite3.connect(str(path))
+        try:
+            rows = conn.execute(
+                f"SELECT {_DB_HISTORY_COLUMNS[kind]} FROM {kind} "
+                "ORDER BY ts DESC LIMIT ?",
+                (max(0, int(limit)),),
+            ).fetchall()
+        except sqlite3.Error as exc:  # missing table / not a database yet
+            logger.debug("No %s history in %s: %s", kind, path, exc)
+            return []
+        finally:
+            conn.close()
+
+        records: list[dict] = []
+        for row in reversed(rows):  # chronological order for plotting
+            record: dict = {
+                "kind": kind,
+                "ts": round(float(row[0]), 6),
+                "iso_time": row[1],
+            }
+            if kind == "heart_rate":
+                record["bpm"] = int(row[2])
+            elif kind == "steps":
+                record.update(
+                    steps=int(row[2]), distance_m=int(row[3]), calories=int(row[4])
+                )
+            elif kind == "imu":
+                record["magnitude_g"] = round(
+                    math.hypot(float(row[2]), float(row[3]), float(row[4])), 4
+                )
+            else:  # spo2 -- dashboard uses "status" for the auto-measure flag
+                record.update(spo2=int(row[2]), status=int(row[3]))
+            records.append(record)
+        return records
+
+    return provider
 
 
 class TelemetryHub:
@@ -330,7 +397,8 @@ class DashboardServer:
         limit = max(1, min(limit, self.hub._max_points))
         if self.history_provider is not None and (params.get("source") or ["memory"])[0] == "db":
             try:
-                rows = self.history_provider(kind, limit)
+                # SQLite I/O must not block the asyncio loop that also serves BLE.
+                rows = await asyncio.to_thread(self.history_provider, kind, limit)
             except Exception as exc:
                 await self._send_json(writer, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
                 return

@@ -78,14 +78,20 @@
 
 <footer>
   数据来源：Mi Band 6 BLE 直连 · SSE 实时推送 · 已接收 <span id="events">0</span> 条事件 ·
-  last update <span id="updated">--</span>
+  last update <span id="updated">--</span><span id="historyNote"></span>
 </footer>
 
 <script>
 "use strict";
 
 const MAX_POINTS = 300;                       // points kept per chart in the browser
+const HISTORY_LIMIT = 300;                    // persisted rows requested on load
+const KINDS = ["heart_rate", "spo2", "steps", "imu"];
 const series = { heart_rate: [], spo2: [], steps: [], imu: [] };
+// Persisted rows are kept apart from the live buffer so every snapshot (the
+// initial fetch AND the first SSE frame) can merge them back without losing
+// history or duplicating points.
+const dbSeries = { heart_rate: [], spo2: [], steps: [], imu: [] };
 const latest = {};
 let messageCount = 0;
 let renderQueued = false;
@@ -206,19 +212,51 @@ function renderAll() {
 function applyRecord(record) {
   const kind = record.kind;
   if (!series[kind]) return;
-  series[kind].push(record);
-  if (series[kind].length > MAX_POINTS) series[kind].shift();
-  applyLatest(kind, record);
+  const rows = series[kind];
+  if (rows.length && record.ts < rows[rows.length - 1].ts) {
+    // A late frame (e.g. a band-side timestamp arriving after live samples)
+    // must not corrupt the chronological order of the chart.
+    let index = rows.length - 1;
+    while (index >= 0 && rows[index].ts > record.ts) index -= 1;
+    rows.splice(index + 1, 0, record);
+  } else {
+    rows.push(record);
+  }
+  if (rows.length > MAX_POINTS) rows.shift();
+  if (rows[rows.length - 1] === record) applyLatest(kind, record);
   messageCount += 1;
   setText("events", String(messageCount));
   scheduleRender();
 }
 
+function mergeRows(historyRows, liveRows) {
+  const byTs = new Map();
+  (historyRows || []).forEach((row) => byTs.set(row.ts, row));
+  // Live rows win on a timestamp collision: they are the freshest reading.
+  (liveRows || []).forEach((row) => byTs.set(row.ts, row));
+  return Array.from(byTs.values()).sort((a, b) => a.ts - b.ts).slice(-MAX_POINTS);
+}
+
+function loadDbHistory() {
+  return Promise.all(KINDS.map((kind) =>
+    fetch("/api/history?kind=" + encodeURIComponent(kind) +
+          "&source=db&limit=" + HISTORY_LIMIT)
+      .then((response) => response.ok ? response.json() : null)
+      .then((payload) => {
+        if (payload && Array.isArray(payload.rows)) dbSeries[kind] = payload.rows;
+      })
+      .catch(() => {})   // no provider / no database yet -> live-only view
+  )).then(() => {
+    const total = KINDS.reduce((sum, kind) => sum + dbSeries[kind].length, 0);
+    setText("historyNote", total ? " · 含 " + total + " 条数据库历史" : "");
+  });
+}
+
 function applySnapshot(snapshot) {
   if (!snapshot || !snapshot.series) return;
-  for (const kind of Object.keys(series)) {
-    const rows = snapshot.series[kind] || [];
-    series[kind] = rows.slice(-MAX_POINTS);
+  for (const kind of KINDS) {
+    series[kind] = mergeRows(dbSeries[kind], snapshot.series[kind] || []);
+    const rows = series[kind];
     if (rows.length) applyLatest(kind, rows[rows.length - 1]);
   }
   setText("events", String(snapshot.events_sent || 0));
@@ -248,11 +286,15 @@ function connectEvents() {
   };
 }
 
-fetch("/api/snapshot")
-  .then((response) => response.json())
-  .then(applySnapshot)
-  .catch(() => {});
-connectEvents();
+// Load persisted rows BEFORE opening SSE: the stream's first frame is itself a
+// snapshot, and applying it earlier would wipe the history we just fetched.
+Promise.all([
+  fetch("/api/snapshot").then((response) => response.json()).catch(() => null),
+  loadDbHistory(),
+]).then(([snapshot]) => {
+  applySnapshot(snapshot);
+  connectEvents();
+});
 window.addEventListener("resize", scheduleRender);
 </script>
 </body>
