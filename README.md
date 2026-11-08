@@ -813,3 +813,17 @@ Gadgetbridge 对拿不到会话记录的设备也有推导实现（`util/sleep/S
 - 对外反馈问题前，按 [`docs/history_hardware_validation.md`](docs/history_hardware_validation.md) §9
   对日志做 MAC 脱敏，并确认其中不含 `auth_key`。
 - 提交前可自查：`git status --ignored`、`git ls-files -ci --exclude-standard`。
+
+---
+
+## 16. 许可证
+
+本项目以 [MIT License](LICENSE) 发布，Copyright © 2026 alex-j-zhang。
+
+第三方组件的许可证归属见上文 §15「安全与第三方」及其自带声明：
+
+| 路径 | 来源 | 许可证 |
+|---|---|---|
+| `huami_token/` | huami-token（© 2025 Kirill Snezhko） | MIT |
+| `vendor/tiny_ecdh/` | tiny-ECDH-python 0.1.0（© 2023 Daniel Oliveira） | MIT |
+| `ecdh.c` / `ecdh.h` | tiny-ECDH C 实现（Kenneth MacKay） | Public domain |
