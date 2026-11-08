@@ -11,6 +11,8 @@ Usage::
 
     python tools/capture_history_payload.py --days 7 --output validation/payloads
     python tools/capture_history_payload.py --days 1 --timeout 20
+    python tools/capture_history_payload.py --days 7 --spo2-sleep \
+        --output validation/payloads-26
 
 Requires ``.env`` with ``DEVICE_ID`` (or legacy ``DEVICE_MAC``) / ``AUTH_KEY``
 (see README).
@@ -104,9 +106,16 @@ async def _run(args: argparse.Namespace) -> int:
         print("[*] Connecting and authenticating (keep the band screen awake)...")
         await client.connect_and_authenticate(scan_timeout=args.scan_timeout)
         print(f"[*] Fetching up to {args.days} day(s) of history with timeout {args.timeout}s...")
+        if args.spo2_sleep:
+            print(
+                "[!] Also capturing type 0x26 (sleep SpO2): 30B layout verified "
+                "on Mi Band 6; trailing field semantics are still unknown, so "
+                "raw payloads remain the evidence."
+            )
         result = await sync_history(
             client,
             days=args.days,
+            include_spo2_sleep=args.spo2_sleep,
             max_rounds=args.max_rounds,
             timeout=args.timeout,
         )
@@ -126,6 +135,8 @@ async def _run(args: argparse.Namespace) -> int:
         "fetched": summarize_history_result(result),
         "activity_samples": len(result.activity),
         "spo2_samples": len(result.spo2),
+        "spo2_sleep_samples": len(result.spo2_sleep),
+        "spo2_sleep_requested": bool(args.spo2_sleep),
         "rounds": result.rounds,
         "errors": result.errors,
         "payloads": saved,
@@ -150,6 +161,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--timeout", type=float, default=30.0, help="per-message timeout seconds")
     parser.add_argument("--max-rounds", type=int, default=5, help="max fetch rounds per data type")
+    parser.add_argument(
+        "--spo2-sleep",
+        action="store_true",
+        help=(
+            "also request type 0x26 (sleep SpO2) and save its raw payload; "
+            "layout verified, trailing field semantics still unknown"
+        ),
+    )
     parser.add_argument("--scan-timeout", type=float, default=90.0, help="BLE scan timeout seconds")
     args = parser.parse_args(argv)
     return asyncio.run(_run(args))
