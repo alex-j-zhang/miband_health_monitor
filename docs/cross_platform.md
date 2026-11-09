@@ -100,18 +100,23 @@ cp .env.example .env            # 填 DEVICE_ID（MAC）与 AUTH_KEY
 | 现象 | 处理 |
 |---|---|
 | `org.bluez was not provided` / `No Bluetooth adapters found` | `bluetooth` 服务未运行或无适配器；WSL2 不支持蓝牙，请用原生 Linux |
-| 扫描不到 | 手机蓝牙关闭；点亮并滑动屏幕；`bluetoothctl scan on` 交叉确认 |
+| 扫描不到 | 手机蓝牙关闭；点亮并滑动屏幕；当前版本已为 Linux 开启 `DuplicateData=True` 不去重扫描，`scan_ble.py` 会自动列出 BlueZ 缓存设备 |
 | 权限不足 | 普通用户通常可用；若受限，检查 polkit/`bluetooth` 组或使用桌面会话 |
-| 连上 40 秒左右就断，日志 `UnknownObject ... doesn't exist` | **未配对**。按 §2.3 执行 `bluetoothctl pair` + `trust` |
-| 连接时 BlueZ 日志出现 `No agent available for request type 2` | 同上：没有配对 agent。用 `bluetoothctl` 交互式命令配对，或先运行桌面蓝牙面板 |
+| 连上 40 秒左右就断，日志 `UnknownObject ... doesn't exist` | **未配对**。当前版本已内置 D-Bus 配对代理（`BlueZPairingAgent`），运行时会自动响应 SMP 配对请求；亦可手动按 §2.3 执行 `bluetoothctl pair` + `trust` |
+| 连接时 BlueZ 日志出现 `No agent available for request type 2` | 缺少配对 agent。客户端已内置自动注册 `NoInputNoOutput` agent，若手动配对请使用 `bluetoothctl` |
 | 启动日志 `MTU=23` 并伴随 `Using default MTU value` 警告 | 旧版本行为；当前版本会主动协商。若仍出现，加 `--log-level DEBUG` 查看 `_acquire_mtu` 失败原因 |
-| 每次都要等几十秒才连上 | 确认已 `pair`/`trust`（可直连）；或调大 `--scan-timeout`、保持手环屏幕唤醒 |
+| 每次都要等几十秒才连上 | 确认已 `pair`/`trust`（可直连）；当前版本提供连接瞬态重试与极速断线重连，无需每次亮屏 |
 
 ### 2.5 Linux 专属行为说明
 
 | 行为 | 说明 |
 |---|---|
-| 直连优先 | 已配对设备从 BlueZ 对象树直接连接，跳过扫描；失败自动回退扫描 |
+| 直连优先 | 已真正配对/绑定设备从 BlueZ 对象树直接连接（或复用已有连接），跳过扫描；3.5s 无响应自动回退扫描 |
+| 内置配对 Agent | 会话期间在系统 D-Bus 注册 `org.bluez.Agent1`（`NoInputNoOutput`），自动放行目标手环 SMP 请求，避免 40s 断链 |
+| 脉冲扫描 | 扫描器启用 `DuplicateData=True`，捕获手环息屏低频广播脉冲，解决重复载荷被 BlueZ 静默吞掉的问题 |
+| Fast Retry | 捕获广播后遇 `le-connection-abort-by-local` 或 `InProgress` 毫秒级原地重试（最多 3 次） |
+| GATT 写锁 | 引入类 Gadgetbridge `BtLEQueue` 机制，写操作全局串行化，遇 `InProgress` 自动重试 |
+| 极速重连 | 会话认证成功后重置退避延迟，意外断连后以 0.3s 极速重连，抓住断开瞬间高频广播窗口 |
 | `--no-direct-connect` | 强制走扫描路径，便于排查"直连拿到的是旧对象"这类问题 |
 | MTU 协商 | 连接后调用 bleak 的 `_acquire_mtu()`；WinRT 由系统自动完成 |
 | 配对状态 | `Paired: yes` 才能稳定长连；`Trusted: yes` 让 BlueZ 主动回连 |

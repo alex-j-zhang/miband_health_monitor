@@ -15,7 +15,10 @@ from bleak import BleakScanner
 
 async def scan_devices(duration_seconds: int = 8) -> None:
     print(f"Scanning for nearby BLE devices for {duration_seconds} seconds...")
-    devices = await BleakScanner.discover(timeout=duration_seconds, return_adv=True)
+    kwargs = {}
+    if sys.platform.startswith("linux"):
+        kwargs["bluez"] = {"filters": {"DuplicateData": True, "Transport": "le"}}
+    devices = await BleakScanner.discover(timeout=duration_seconds, return_adv=True, **kwargs)
 
     found_bands = []
     other_devices = []
@@ -43,6 +46,28 @@ async def scan_devices(duration_seconds: int = 8) -> None:
     print("\n=== All Discovered BLE Devices ===")
     for address, name, rssi in other_devices:
         print(f"  - Address: {address} | Name: {name} | RSSI: {rssi} dBm")
+
+    if sys.platform.startswith("linux"):
+        try:
+            import bluez_support
+
+            cached = await bluez_support.list_known_devices()
+            known_bands = [
+                d
+                for d in cached
+                if any(keyword in d.get("name", "").lower() for keyword in ["band", "mi", "xiaomi", "huami"])
+            ]
+            if known_bands:
+                print("\n=== BlueZ Cached / Known Devices ===")
+                for d in known_bands:
+                    status = (
+                        f"paired={'yes' if d.get('paired') else 'no'} "
+                        f"trusted={'yes' if d.get('trusted') else 'no'} "
+                        f"connected={'yes' if d.get('connected') else 'no'}"
+                    )
+                    print(f"  * Address: {d['address']} | Name: {d['name']} | {status}")
+        except Exception:
+            pass
 
     if sys.platform == "darwin":
         print(

@@ -296,3 +296,91 @@ async def test_demo_records_can_be_reloaded(tmp_path):
     assert rows
     parsed = json.loads(json.dumps(rows[0]))
     assert 30 <= parsed["bpm"] <= 220
+
+
+async def test_open_client_fast_connect_retry():
+    band = SimulatedBand(auth_key=AUTH_KEY_BYTES)
+    client = make_simulated_client(MAC, AUTH_KEY, band, scanner_address=MAC)
+
+    orig_client_factory = client._client_factory
+    attempts = 0
+
+    def retry_factory(device, timeout=10.0, disconnected_callback=None):
+        nonlocal attempts
+        c = orig_client_factory(device, timeout=timeout, disconnected_callback=disconnected_callback)
+        orig_connect = c.connect
+
+        async def flaky_connect():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("org.bluez.Error.Failed: le-connection-abort-by-local")
+            await orig_connect()
+
+        c.connect = flaky_connect
+        return c
+
+    client._client_factory = retry_factory
+    await client.connect_and_authenticate(scan_timeout=2.0)
+    try:
+        assert client.authenticated is True
+        assert attempts == 2
+    finally:
+        await client.disconnect()
+
+
+async def test_write_gatt_retries_on_in_progress():
+    band = SimulatedBand(auth_key=AUTH_KEY_BYTES)
+    client = await _connect(band)
+    try:
+        call_count = 0
+        orig_write = client.client.write_gatt_char
+
+        async def flaky_write(uuid, data, response=False):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("org.bluez.Error.InProgress")
+            await orig_write(uuid, data, response=response)
+
+        client.client.write_gatt_char = flaky_write
+        await client._write_gatt("00002a39-0000-1000-8000-00805f9b34fb", b"\x16")
+        assert call_count == 2
+    finally:
+        await client.disconnect()
+
+
+async def test_hr_keepalive_loop_tolerates_transient_failure():
+    band = SimulatedBand(auth_key=AUTH_KEY_BYTES)
+    client = await _connect(band)
+    try:
+        fail_count = 0
+
+        async def failing_write(*a, **k):
+            nonlocal fail_count
+            fail_count += 1
+            raise RuntimeError("transient bus error")
+
+        client._write_gatt = failing_write
+        assert getattr(client.client, "is_connected", False) is True
+
+        sleep_count = 0
+
+        async def fast_sleep(sec):
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count > 1:
+                raise asyncio.CancelledError()
+
+        orig_sleep = asyncio.sleep
+        try:
+            asyncio.sleep = fast_sleep
+            with pytest.raises(asyncio.CancelledError):
+                await client._hr_keepalive_loop()
+        finally:
+            asyncio.sleep = orig_sleep
+
+        assert fail_count == 1
+        assert not client.disconnected_event.is_set()
+    finally:
+        await client.disconnect()

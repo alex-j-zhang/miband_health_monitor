@@ -24,6 +24,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import os
 import sys
 from typing import Any, Optional
 
@@ -34,6 +35,9 @@ OBJECT_MANAGER_PATH = "/"
 OBJECT_MANAGER_IFACE = "org.freedesktop.DBus.ObjectManager"
 ADAPTER_IFACE = "org.bluez.Adapter1"
 DEVICE_IFACE = "org.bluez.Device1"
+
+AGENT_MANAGER_PATH = "/org/bluez"
+AGENT_MANAGER_IFACE = "org.bluez.AgentManager1"
 
 #: Default timeout for one short D-Bus introspection round trip.
 DBUS_TIMEOUT = 2.0
@@ -145,10 +149,25 @@ def _device_info_from_props(path: str, props: dict) -> dict:
         "name": name,
         "adapter": adapter,
         "paired": bool(_unwrap(props.get("Paired", False))),
+        "bonded": bool(_unwrap(props.get("Bonded", False))),
         "trusted": bool(_unwrap(props.get("Trusted", False))),
         "connected": bool(_unwrap(props.get("Connected", False))),
         "props": props,
     }
+
+
+async def list_known_devices(*, timeout: float = DBUS_TIMEOUT) -> list[dict]:
+    """Return devices known to BlueZ (cached or bonded)."""
+    if not is_bluez_platform():
+        return []
+    objects = await _managed_objects(timeout=timeout)
+    devices = []
+    for path, interfaces in objects.items():
+        props = interfaces.get(DEVICE_IFACE)
+        if not props:
+            continue
+        devices.append(_device_info_from_props(path, props))
+    return devices
 
 
 async def find_device(address: str, *, timeout: float = DBUS_TIMEOUT) -> Optional[dict]:
@@ -221,21 +240,300 @@ def make_ble_device(info: dict) -> Optional[Any]:
         return None
 
 
-async def paired_device(address: str, *, timeout: float = DBUS_TIMEOUT) -> Optional[Any]:
-    """Return a directly connectable ``BLEDevice`` for a paired/trusted band.
+async def connected_device(address: str, *, timeout: float = DBUS_TIMEOUT) -> Optional[Any]:
+    """Return a directly connectable ``BLEDevice`` if the device is ALREADY connected in BlueZ."""
+    if not is_bluez_platform():
+        return None
+    info = await find_device(address, timeout=timeout)
+    if info is None or not info.get("connected"):
+        return None
+    return make_ble_device(info)
 
-    Only bonded devices are eligible: connecting to a merely cached device
-    still requires it to advertise, which would just delay the fallback scan.
+
+async def paired_device(address: str, *, timeout: float = DBUS_TIMEOUT) -> Optional[Any]:
+    """Return a directly connectable ``BLEDevice`` for a paired/bonded band.
+
+    Only bonded devices are eligible: connecting to a merely cached or trusted
+    device still requires it to advertise, which would just delay the fallback scan.
     """
     if not is_bluez_platform():
         return None
     info = await find_device(address, timeout=timeout)
     if info is None:
         return None
-    if not (info["paired"] or info["trusted"]):
-        logger.debug("Device %s is known to BlueZ but not paired/trusted.", address)
+    if not (info.get("paired") or info.get("bonded")):
+        logger.debug("Device %s is known to BlueZ but not paired/bonded.", address)
         return None
     return make_ble_device(info)
+
+
+def is_transient_connect_error(exc: BaseException) -> bool:
+    """Return True if exc represents a transient connection failure suitable for fast retry."""
+    name = getattr(exc, "dbus_error_name", None) or ""
+    text = str(exc or "")
+    transient_tokens = (
+        "le-connection-abort-by-local",
+        "org.bluez.Error.InProgress",
+        "InProgress",
+        "Software caused connection abort",
+        "Connection refused",
+        "Resource temporarily unavailable",
+        "0x3e",
+    )
+    return any(token in text or token in name for token in transient_tokens)
+
+
+def is_in_progress_error(exc: BaseException) -> bool:
+    """Return True if exc represents an InProgress BlueZ GATT error."""
+    name = getattr(exc, "dbus_error_name", None) or ""
+    text = str(exc or "")
+    return "org.bluez.Error.InProgress" in name or "InProgress" in text
+
+
+def scanner_kwargs(scanner_factory: Any = None) -> dict:
+    """Return platform-specific kwargs for BleakScanner.
+
+    On Linux with BleakScanner, enable DuplicateData=True so BlueZ does not
+    suppress consecutive advertisements from the same band when asleep/low-power.
+    """
+    if not is_bluez_platform():
+        return {}
+    if scanner_factory is not None:
+        factory_name = getattr(scanner_factory, "__name__", "")
+        module_name = getattr(scanner_factory, "__module__", "")
+        if "sim" in module_name or "Fake" in factory_name:
+            return {}
+    return {
+        "bluez": {
+            "filters": {
+                "DuplicateData": True,
+                "Transport": "le",
+            }
+        }
+    }
+
+
+async def set_adapter_pairable(adapter: str = "hci0", pairable: bool = True, timeout: float = DBUS_TIMEOUT) -> bool:
+    """Set the Pairable property on the BlueZ adapter."""
+    if not is_bluez_platform():
+        return False
+    try:
+        from dbus_fast import BusType, Message, Variant
+        from dbus_fast.aio import MessageBus
+
+        bus = await asyncio.wait_for(MessageBus(bus_type=BusType.SYSTEM).connect(), timeout=timeout)
+        try:
+            adapter_path = f"/org/bluez/{adapter}"
+            msg = Message(
+                destination=BLUEZ_SERVICE,
+                path=adapter_path,
+                interface="org.freedesktop.DBus.Properties",
+                member="Set",
+                signature="ssv",
+                body=[ADAPTER_IFACE, "Pairable", Variant("b", pairable)],
+            )
+            reply = await asyncio.wait_for(bus.call(msg), timeout=timeout)
+            return reply.message_type == 2  # METHOD_RETURN
+        finally:
+            bus.disconnect()
+    except Exception as exc:
+        logger.debug("Failed to set adapter pairable: %s", exc)
+        return False
+
+
+async def set_device_trusted(device_path: str, trusted: bool = True, timeout: float = DBUS_TIMEOUT) -> bool:
+    """Set the Trusted property on the BlueZ device."""
+    if not is_bluez_platform():
+        return False
+    try:
+        from dbus_fast import BusType, Message, Variant
+        from dbus_fast.aio import MessageBus
+
+        bus = await asyncio.wait_for(MessageBus(bus_type=BusType.SYSTEM).connect(), timeout=timeout)
+        try:
+            msg = Message(
+                destination=BLUEZ_SERVICE,
+                path=device_path,
+                interface="org.freedesktop.DBus.Properties",
+                member="Set",
+                signature="ssv",
+                body=[DEVICE_IFACE, "Trusted", Variant("b", trusted)],
+            )
+            reply = await asyncio.wait_for(bus.call(msg), timeout=timeout)
+            return reply.message_type == 2
+        finally:
+            bus.disconnect()
+    except Exception as exc:
+        logger.debug("Failed to set device trusted: %s", exc)
+        return False
+
+
+class BlueZPairingAgent:
+    """In-process org.bluez.Agent1 pairing agent that auto-accepts auth for the target band."""
+
+    def __init__(self, target_address: Optional[str] = None) -> None:
+        self.target_address = normalize_address(target_address or "") if target_address else None
+        self._bus = None
+        self._agent = None
+        self._agent_path: Optional[str] = None
+        self._registered = False
+
+    async def start(self) -> bool:
+        if not is_bluez_platform():
+            return False
+        if self._registered:
+            return True
+        try:
+            from dbus_fast import BusType, Message
+            from dbus_fast.aio import MessageBus
+            from dbus_fast.errors import DBusError
+            from dbus_fast.service import ServiceInterface, method
+        except Exception as exc:
+            logger.debug("Cannot import dbus_fast for pairing agent: %s", exc)
+            return False
+
+        target = self.target_address
+
+        def _is_target(device_path: str) -> bool:
+            if not target:
+                return True
+            suffix = target.replace(":", "_").upper()
+            return str(device_path).upper().endswith(suffix)
+
+        class _AgentImpl(ServiceInterface):
+            def __init__(self):
+                super().__init__("org.bluez.Agent1")
+
+            @method()
+            def Release(self):
+                logger.debug("Pairing agent released by BlueZ.")
+
+            @method()
+            def RequestPinCode(self, device: "o") -> "s":
+                if not _is_target(device):
+                    raise DBusError("org.bluez.Error.Rejected", "Unauthorized device")
+                logger.info("Auto-accepting PIN code request for %s", device)
+                return "0000"
+
+            @method()
+            def DisplayPinCode(self, device: "o", pincode: "s"):
+                pass
+
+            @method()
+            def RequestPasskey(self, device: "o") -> "u":
+                if not _is_target(device):
+                    raise DBusError("org.bluez.Error.Rejected", "Unauthorized device")
+                logger.info("Auto-accepting passkey request for %s", device)
+                return 0
+
+            @method()
+            def DisplayPasskey(self, device: "o", passkey: "u", entered: "q"):
+                pass
+
+            @method()
+            def RequestConfirmation(self, device: "o", passkey: "u"):
+                if not _is_target(device):
+                    raise DBusError("org.bluez.Error.Rejected", "Unauthorized device")
+                logger.info("Auto-confirming pairing passkey %06d for target band (%s)", passkey, device)
+                return None
+
+            @method()
+            def RequestAuthorization(self, device: "o"):
+                if not _is_target(device):
+                    raise DBusError("org.bluez.Error.Rejected", "Unauthorized device")
+                logger.info("Auto-authorizing pairing request for target band (%s)", device)
+                return None
+
+            @method()
+            def AuthorizeService(self, device: "o", uuid: "s"):
+                if not _is_target(device):
+                    raise DBusError("org.bluez.Error.Rejected", "Unauthorized device")
+                logger.debug("Auto-authorizing service %s for target band (%s)", uuid, device)
+                return None
+
+            @method()
+            def Cancel(self):
+                logger.debug("Pairing agent request cancelled.")
+
+        try:
+            self._bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            self._agent_path = f"/miband/agent/{os.getpid()}_{id(self)}"
+            self._agent = _AgentImpl()
+            self._bus.export(self._agent_path, self._agent)
+
+            reg_msg = Message(
+                destination=BLUEZ_SERVICE,
+                path=AGENT_MANAGER_PATH,
+                interface=AGENT_MANAGER_IFACE,
+                member="RegisterAgent",
+                signature="os",
+                body=[self._agent_path, "NoInputNoOutput"],
+            )
+            reply = await self._bus.call(reg_msg)
+            if reply.message_type != Message.METHOD_RETURN:
+                logger.warning("Could not register pairing agent: %s", reply.body)
+                await self.stop()
+                return False
+
+            req_def = Message(
+                destination=BLUEZ_SERVICE,
+                path=AGENT_MANAGER_PATH,
+                interface=AGENT_MANAGER_IFACE,
+                member="RequestDefaultAgent",
+                signature="o",
+                body=[self._agent_path],
+            )
+            with contextlib.suppress(Exception):
+                await self._bus.call(req_def)
+
+            self._registered = True
+            logger.debug("BlueZ in-process pairing agent registered at %s", self._agent_path)
+            return True
+        except Exception as exc:
+            logger.warning("Failed to initialize BlueZ pairing agent: %s", exc)
+            await self.stop()
+            return False
+
+    async def stop(self) -> None:
+        if not self._registered and self._bus is None:
+            return
+        bus = self._bus
+        agent = self._agent
+        agent_path = self._agent_path
+        self._registered = False
+        self._bus = None
+        self._agent = None
+        self._agent_path = None
+
+        if bus is not None and agent_path is not None:
+            try:
+                from dbus_fast import Message
+
+                unreg = Message(
+                    destination=BLUEZ_SERVICE,
+                    path=AGENT_MANAGER_PATH,
+                    interface=AGENT_MANAGER_IFACE,
+                    member="UnregisterAgent",
+                    signature="o",
+                    body=[agent_path],
+                )
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(bus.call(unreg), timeout=1.0)
+            except Exception:
+                pass
+            if agent is not None:
+                with contextlib.suppress(Exception):
+                    bus.unexport(agent_path, agent)
+            with contextlib.suppress(Exception):
+                bus.disconnect()
+
+    async def ensure_ready_for_device(self, address: str, adapter: str = "hci0") -> None:
+        """Ensure the adapter is pairable and the target device is marked trusted in BlueZ."""
+        if not is_bluez_platform():
+            return
+        await set_adapter_pairable(adapter, True)
+        dev_path = device_path_for_address(address, adapter)
+        await set_device_trusted(dev_path, True)
 
 
 async def try_acquire_mtu(client: Any) -> bool:

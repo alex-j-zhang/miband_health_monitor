@@ -348,3 +348,104 @@ async def test_doctor_warns_when_the_device_is_not_configured(monkeypatch, tmp_p
     lines: list[str] = []
     code = await doctor.run_doctor("", "", str(tmp_path / "data"), emit=lines.append)
     assert code == 1
+
+
+async def test_paired_device_rejects_trusted_only(monkeypatch):
+    monkeypatch.setattr(bluez_support, "is_bluez_platform", lambda: True)
+
+    async def trusted_only(_address, timeout=0):
+        return {
+            "path": "/org/bluez/hci0/dev_X",
+            "address": MAC,
+            "paired": False,
+            "bonded": False,
+            "trusted": True,
+            "connected": False,
+            "props": {},
+        }
+
+    monkeypatch.setattr(bluez_support, "find_device", trusted_only)
+    assert await bluez_support.paired_device(MAC) is None
+
+
+async def test_connected_device_returns_device_when_connected(monkeypatch):
+    monkeypatch.setattr(bluez_support, "is_bluez_platform", lambda: True)
+
+    async def disconnected(_address, timeout=0):
+        return {"path": "/org/bluez/hci0/dev_X", "address": MAC, "connected": False, "props": {}}
+
+    monkeypatch.setattr(bluez_support, "find_device", disconnected)
+    assert await bluez_support.connected_device(MAC) is None
+
+    async def connected(_address, timeout=0):
+        return {
+            "path": "/org/bluez/hci0/dev_X",
+            "address": MAC,
+            "name": "Mi Smart Band 6",
+            "connected": True,
+            "props": {},
+        }
+
+    monkeypatch.setattr(bluez_support, "find_device", connected)
+    dev = await bluez_support.connected_device(MAC)
+    assert dev is not None
+    assert dev.details["path"] == "/org/bluez/hci0/dev_X"
+
+
+def test_is_transient_connect_error():
+    assert bluez_support.is_transient_connect_error(Exception("le-connection-abort-by-local")) is True
+    assert bluez_support.is_transient_connect_error(Exception("org.bluez.Error.InProgress")) is True
+    assert bluez_support.is_transient_connect_error(Exception("Software caused connection abort")) is True
+    assert bluez_support.is_transient_connect_error(Exception("Permanent authentication failure")) is False
+
+
+def test_is_in_progress_error():
+    assert bluez_support.is_in_progress_error(Exception("org.bluez.Error.InProgress")) is True
+    assert bluez_support.is_in_progress_error(Exception("GATT InProgress")) is True
+    assert bluez_support.is_in_progress_error(Exception("Other error")) is False
+
+
+def test_scanner_kwargs(monkeypatch):
+    monkeypatch.setattr(bluez_support, "is_bluez_platform", lambda: True)
+    kwargs = bluez_support.scanner_kwargs()
+    assert kwargs.get("bluez", {}).get("filters", {}).get("DuplicateData") is True
+
+    class FakeBleakScanner:
+        pass
+
+    assert bluez_support.scanner_kwargs(FakeBleakScanner) == {}
+
+
+async def test_pairing_agent_lifecycle(monkeypatch):
+    agent = bluez_support.BlueZPairingAgent(MAC)
+    assert agent.target_address == MAC
+    monkeypatch.setattr(bluez_support, "is_bluez_platform", lambda: False)
+    assert await agent.start() is False
+    await agent.stop()
+
+
+async def test_doctor_warns_when_device_is_trusted_but_unpaired(monkeypatch, tmp_path):
+    monkeypatch.setattr(doctor, "is_bluez_platform", lambda: True)
+
+    async def mock_adapters(*a, **k):
+        return [{"name": "hci0", "powered": True, "pairable": True, "discovering": False}]
+
+    async def mock_device(addr, *a, **k):
+        return {
+            "address": MAC,
+            "name": "Mi Smart Band 6",
+            "paired": False,
+            "bonded": False,
+            "trusted": True,
+            "connected": False,
+        }
+
+    monkeypatch.setattr(doctor, "list_adapters", mock_adapters)
+    monkeypatch.setattr(doctor, "find_device", mock_device)
+
+    lines = []
+    code = await doctor.run_doctor(MAC, KEY, str(tmp_path / "data"), emit=lines.append)
+    text = "\n".join(lines)
+    assert code == 0
+    assert "is NOT paired/bonded" in text
+    assert "bypassed" in text

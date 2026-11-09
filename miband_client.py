@@ -77,7 +77,7 @@ CHUNKED_ATT_OVERHEAD = 3
 #: Upper bound for the Linux "connect the bonded device without scanning"
 #: attempt.  A sleeping / out-of-range band must not stall startup, so a failed
 #: direct attempt falls back to discovery quickly.
-DIRECT_CONNECT_TIMEOUT = 12.0
+DIRECT_CONNECT_TIMEOUT = 3.5
 
 # The band's step-1 auth payload is always 16-byte challenge + 48-byte pubkey.
 AUTH_STEP1_RANDOM_SIZE = 16
@@ -329,6 +329,20 @@ def _resolve_mtu(client: object, mtu: Optional[int] = None) -> int:
     return max(CHUNKED_DEFAULT_MTU, resolved)
 
 
+async def _write_with_in_progress_retry(
+    client: Any, char_uuid: str, data: bytes, response: bool = False
+) -> None:
+    for attempt in range(2):
+        try:
+            await client.write_gatt_char(char_uuid, data, response=response)
+            return
+        except Exception as exc:
+            if attempt == 0 and bluez_support.is_in_progress_error(exc):
+                await asyncio.sleep(0.15)
+                continue
+            raise
+
+
 async def write_chunked_value(
     client: BleakClient,
     char_uuid: str,
@@ -336,6 +350,7 @@ async def write_chunked_value(
     handle: int,
     data: bytes,
     mtu: Optional[int] = None,
+    lock: Optional[asyncio.Lock] = None,
 ) -> None:
     """Split and transmit a payload using the Mi Band 6 Chunked Transfer Protocol.
 
@@ -377,7 +392,11 @@ async def write_chunked_value(
             chunk[9:11] = (endpoint_type & 0xFFFF).to_bytes(2, "little")
         chunk[header_size:] = data[offset : offset + copy_bytes]
 
-        await client.write_gatt_char(char_uuid, bytes(chunk), response=False)
+        if lock is not None:
+            async with lock:
+                await _write_with_in_progress_retry(client, char_uuid, bytes(chunk), response=False)
+        else:
+            await _write_with_in_progress_retry(client, char_uuid, bytes(chunk), response=False)
         offset += copy_bytes
         count += 1
         first = False
@@ -459,6 +478,16 @@ class MiBand6Client:
         self._next_seq = 0
         self._step2_sent = False
 
+        self._gatt_lock = asyncio.Lock()
+        self._pairing_agent: Optional[bluez_support.BlueZPairingAgent] = None
+
+    async def _write_gatt(self, char_uuid: str, data: bytes, response: bool = False) -> None:
+        """Write to a GATT characteristic serialized by _gatt_lock with InProgress retry."""
+        if self.client is None:
+            raise RuntimeError("Client is not connected")
+        async with self._gatt_lock:
+            await _write_with_in_progress_retry(self.client, char_uuid, data, response=response)
+
     # ------------------------------------------------------------- properties
     @property
     def mac_address(self) -> str:
@@ -497,6 +526,16 @@ class MiBand6Client:
         if not bluez_support.looks_like_mac(self.device_id):
             return None
 
+        # 1. If already connected in BlueZ, reuse connection directly without scanning.
+        connected_dev = await bluez_support.connected_device(self.device_id)
+        if connected_dev is not None:
+            logger.info(
+                "Mi Band %s is already connected in BlueZ; reusing connection.",
+                self.device_id,
+            )
+            return connected_dev
+
+        # 2. If properly paired/bonded in BlueZ, attempt fast direct connection.
         device = await bluez_support.paired_device(self.device_id)
         if device is not None:
             logger.info(
@@ -515,7 +554,8 @@ class MiBand6Client:
                 found_device = device
                 stop_event.set()
 
-        scanner = self._scanner_factory(detection_callback=_on_detection)
+        scanner_kwargs = bluez_support.scanner_kwargs(self._scanner_factory)
+        scanner = self._scanner_factory(detection_callback=_on_detection, **scanner_kwargs)
         await scanner.start()
         heartbeat = asyncio.create_task(self._scan_heartbeat(stop_event))
         try:
@@ -565,6 +605,23 @@ class MiBand6Client:
                 disconnected_callback=self._on_disconnected,
             )
 
+        async def _connect_with_transient_retry(client_obj: Any, max_retries: int = 2) -> None:
+            for attempt in range(max_retries + 1):
+                try:
+                    await client_obj.connect()
+                    return
+                except Exception as exc:
+                    if attempt < max_retries and bluez_support.is_transient_connect_error(exc):
+                        logger.debug(
+                            "Transient connection error (%s); fast-retrying in 0.4s (attempt %d/%d)...",
+                            bluez_support.describe_ble_error(exc),
+                            attempt + 1,
+                            max_retries,
+                        )
+                        await asyncio.sleep(0.4)
+                        continue
+                    raise
+
         found_device = direct_device
         if found_device is None:
             logger.info(
@@ -582,7 +639,10 @@ class MiBand6Client:
             found_device, connect_timeout if direct_device is None else direct_timeout
         )
         try:
-            await self.client.connect()
+            if direct_device is not None:
+                await self.client.connect()
+            else:
+                await _connect_with_transient_retry(self.client)
         except Exception as exc:
             if direct_device is None:
                 raise
@@ -597,7 +657,7 @@ class MiBand6Client:
             found_device = await self._discover_device(scan_timeout)
             logger.info("Band detected! Establishing BLE link (keep screen awake)...")
             self.client = _new_client(found_device, connect_timeout)
-            await self.client.connect()
+            await _connect_with_transient_retry(self.client)
 
     async def _apply_mtu(self) -> None:
         """Resolve the ATT MTU once, asking BlueZ for it explicitly first."""
@@ -630,8 +690,15 @@ class MiBand6Client:
         self._disconnected.clear()
         self._prv_key, self._pub_key = generate_ecdh_keys()
 
+        if bluez_support.is_bluez_platform() and self._client_factory is BleakClient:
+            if self._pairing_agent is None:
+                self._pairing_agent = bluez_support.BlueZPairingAgent(self.device_id)
+                await self._pairing_agent.start()
+
         direct_device = await self._direct_connect_target()
         await self._open_client(direct_device, scan_timeout, connect_timeout)
+        if self._pairing_agent is not None:
+            await self._pairing_agent.ensure_ready_for_device(self.device_id)
         await self._apply_mtu()
 
         await self.client.start_notify(UUID_CHAR_CHUNKED_READ, self._on_chunked_notification)
@@ -645,6 +712,7 @@ class MiBand6Client:
             0,
             initial_auth,
             mtu=self._session_mtu,
+            lock=self._gatt_lock,
         )
 
         # A link drop during the handshake must not leave the session waiting
@@ -851,6 +919,7 @@ class MiBand6Client:
                 self._handle,
                 response,
                 mtu=self._session_mtu,
+                lock=self._gatt_lock,
             )
         except Exception as exc:
             logger.error("Failed to complete auth step 2: %s", exc)
@@ -917,31 +986,49 @@ class MiBand6Client:
         logger.info("Initializing heart rate sensor...")
 
         # Reset measurement state, subscribe, then start continuous measurement.
-        await self.client.write_gatt_char(UUID_CHAR_HR_CONTROL, b"\x15\x02\x00", response=False)
-        await self.client.write_gatt_char(UUID_CHAR_HR_CONTROL, b"\x15\x01\x00", response=False)
+        await self._write_gatt(UUID_CHAR_HR_CONTROL, b"\x15\x02\x00", response=False)
+        await self._write_gatt(UUID_CHAR_HR_CONTROL, b"\x15\x01\x00", response=False)
         await self.client.start_notify(UUID_CHAR_HR_MEASUREMENT, self._on_heart_rate_notification)
-        await self.client.write_gatt_char(UUID_CHAR_HR_CONTROL, b"\x15\x01\x01", response=False)
+        await self._write_gatt(UUID_CHAR_HR_CONTROL, b"\x15\x01\x01", response=False)
 
         self._hr_active = True
         self._keepalive_task = asyncio.create_task(self._hr_keepalive_loop())
         logger.info("Continuous heart rate monitoring active!")
 
     async def _hr_keepalive_loop(self) -> None:
+        consecutive_failures = 0
         try:
             while True:
                 await asyncio.sleep(12)
                 if self.client is None:
                     return
                 logger.debug("Pinging heart rate monitor keep-alive [0x16]...")
-                await self.client.write_gatt_char(UUID_CHAR_HR_CONTROL, b"\x16", response=False)
+                try:
+                    await self._write_gatt(UUID_CHAR_HR_CONTROL, b"\x16", response=False)
+                    consecutive_failures = 0
+                except Exception as exc:
+                    consecutive_failures += 1
+                    is_fatal = (
+                        self.client is None
+                        or not getattr(self.client, "is_connected", False)
+                        or "UnknownObject" in str(exc)
+                        or getattr(exc, "dbus_error_name", "") == "org.freedesktop.DBus.Error.UnknownObject"
+                    )
+                    if is_fatal or consecutive_failures >= 2:
+                        logger.error(
+                            "Heart-rate keep-alive failed (%d consecutive failures); treating link as lost: %s",
+                            consecutive_failures,
+                            bluez_support.describe_ble_error(exc),
+                        )
+                        self._disconnected.set()
+                        return
+                    logger.warning(
+                        "Heart-rate keep-alive warning (attempt %d/2, retrying next cycle): %s",
+                        consecutive_failures,
+                        bluez_support.describe_ble_error(exc),
+                    )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            logger.error(
-                "Heart-rate keep-alive failed; treating link as lost: %s",
-                bluez_support.describe_ble_error(exc),
-            )
-            self._disconnected.set()
 
     async def stop_heart_rate_stream(self) -> None:
         """Stop the heart-rate stream and cancel the keep-alive loop."""
@@ -989,13 +1076,13 @@ class MiBand6Client:
             raise RuntimeError("Client is not connected")
         self._sensor_callback = callback
         logger.info("Initializing raw IMU sensor stream...")
-        await self.client.write_gatt_char(
+        await self._write_gatt(
             UUID_CHAR_RAW_SENSOR_CONTROL, CMD_RAW_SENSOR_START_1, response=False
         )
-        await self.client.write_gatt_char(
+        await self._write_gatt(
             UUID_CHAR_RAW_SENSOR_CONTROL, CMD_RAW_SENSOR_START_2, response=False
         )
-        await self.client.write_gatt_char(
+        await self._write_gatt(
             UUID_CHAR_RAW_SENSOR_CONTROL, CMD_RAW_SENSOR_START_3, response=False
         )
         await self.client.start_notify(UUID_CHAR_RAW_SENSOR_DATA, self._on_sensor_notification)
@@ -1005,7 +1092,7 @@ class MiBand6Client:
     async def stop_raw_sensor_stream(self) -> None:
         if self._sensor_active and self.client is not None:
             try:
-                await self.client.write_gatt_char(
+                await self._write_gatt(
                     UUID_CHAR_RAW_SENSOR_CONTROL, CMD_RAW_SENSOR_STOP, response=False
                 )
                 await self.client.stop_notify(UUID_CHAR_RAW_SENSOR_DATA)
@@ -1020,6 +1107,10 @@ class MiBand6Client:
             await self.stop_heart_rate_stream()
             await self.stop_steps_stream()
             await self.stop_raw_sensor_stream()
+            if self._pairing_agent is not None:
+                with contextlib.suppress(Exception):
+                    await self._pairing_agent.stop()
+                self._pairing_agent = None
             client = self.client
             self.client = None
             if client is not None and getattr(client, "is_connected", False):
@@ -1100,6 +1191,8 @@ async def run_monitor(
     )
     deadline = None if duration is None else time.monotonic() + duration
     attempt = 0
+    consecutive_failures = 0
+    history_synced = False
 
     while True:
         remaining = None if deadline is None else deadline - time.monotonic()
@@ -1110,15 +1203,20 @@ async def run_monitor(
         attempt += 1
         client = make_client(device_id, auth_key_hex)
         failure: Optional[BaseException] = None
+        was_authenticated = False
         try:
             await client.connect_and_authenticate(scan_timeout=scan_timeout)
-            if sync_history_days is not None:
+            was_authenticated = True
+            consecutive_failures = 0
+
+            if sync_history_days is not None and not history_synced:
                 await _sync_band_history(
                     client,
                     sync_history_days,
                     callbacks,
                     include_spo2_sleep=sync_sleep_spo2,
                 )
+                history_synced = True
             # Order matters on real hardware: the raw sensor hub stream must be
             # activated *before* the heart-rate stream.  Starting it afterwards
             # silently starves the standard BLE heart-rate characteristic
@@ -1155,14 +1253,20 @@ async def run_monitor(
             await client.disconnect()
 
         if not reconnect:
-            if failure is not None and not client.authenticated:
+            if failure is not None and not was_authenticated:
                 raise failure
             return
 
-        delay = min(
-            reconnect_max_delay,
-            reconnect_initial_delay * (2 ** min(attempt - 1, 5)),
-        )
+        if was_authenticated and failure is not None:
+            # When an established session drops, the band advertises aggressively for a few seconds.
+            # Fast-reconnect immediately to catch this reconnection window without waking the screen!
+            delay = min(0.3, reconnect_initial_delay)
+        else:
+            consecutive_failures += 1
+            delay = min(
+                reconnect_max_delay,
+                reconnect_initial_delay * (2 ** min(consecutive_failures - 1, 5)),
+            )
         remaining = None if deadline is None else deadline - time.monotonic()
         if remaining is not None:
             if remaining <= 0:

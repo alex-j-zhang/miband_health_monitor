@@ -6,6 +6,7 @@ CoreBluetooth UUID on macOS.
 """
 
 import asyncio
+import sys
 
 from bleak import BleakScanner
 
@@ -17,7 +18,11 @@ async def main():
         name = device.name or advertisement_data.local_name or "Unknown"
         print(f"[FOUND] {device.address} | Name: {name} | RSSI: {advertisement_data.rssi}")
 
-    scanner = BleakScanner(detection_callback=detection_callback)
+    kwargs = {}
+    if sys.platform.startswith("linux"):
+        kwargs["bluez"] = {"filters": {"DuplicateData": True, "Transport": "le"}}
+
+    scanner = BleakScanner(detection_callback=detection_callback, **kwargs)
     print(
         f"Starting continuous live BLE scan for {SCAN_SECONDS} seconds. "
         "Tap and keep sliding the band screen..."

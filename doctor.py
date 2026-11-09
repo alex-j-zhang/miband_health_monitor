@@ -226,21 +226,38 @@ async def _check_bluez(report: _Report, device_id: str) -> None:
         return
 
     mac = info["address"] or device_id
-    if info["paired"] or info["trusted"]:
+    is_paired = bool(info.get("paired")) or bool(info.get("bonded"))
+    is_trusted = bool(info.get("trusted"))
+    is_connected = bool(info.get("connected"))
+
+    report.add(
+        OK if is_paired else WARN,
+        "device",
+        f"{_mask(mac)} paired={'yes' if is_paired else 'no'} "
+        f"trusted={'yes' if is_trusted else 'no'} "
+        f"connected={'yes' if is_connected else 'no'}",
+    )
+    if not is_paired:
         report.add(
-            OK,
-            "device",
-            f"{_mask(mac)} paired={'yes' if info['paired'] else 'no'} "
-            f"trusted={'yes' if info['trusted'] else 'no'} "
-            f"connected={'yes' if info['connected'] else 'no'}",
+            WARN,
+            "bonding",
+            f"{_mask(mac)} is NOT paired/bonded; link will drop after ~40s without an agent",
+            hint=(
+                "miband_client will auto-pair using its built-in agent, or run:\n"
+                "bluetoothctl pairable on\n"
+                f"bluetoothctl pair {mac}\n"
+                f"bluetoothctl trust {mac}"
+            ),
         )
-        if not info["trusted"]:
-            report.add(
-                INFO,
-                "trust",
-                "not trusted: BlueZ will not auto-reconnect on its own",
-                hint=f"bluetoothctl trust {mac}",
-            )
+    elif not is_trusted:
+        report.add(
+            INFO,
+            "trust",
+            "not trusted: BlueZ will not auto-reconnect on its own",
+            hint=f"bluetoothctl trust {mac}",
+        )
+
+    if is_paired:
         report.add(
             OK,
             "direct connect",
@@ -248,13 +265,7 @@ async def _check_bluez(report: _Report, device_id: str) -> None:
         )
     else:
         report.add(
-            WARN,
-            "device",
-            f"{_mask(mac)} is known but NOT paired; the band drops the link after ~40 s",
-            hint=(
-                "bluetoothctl pairable on\n"
-                f"bluetoothctl pair {mac}\n"
-                f"bluetoothctl trust {mac}\n"
-                "(bluetoothctl registers the pairing agent it needs)"
-            ),
+            INFO,
+            "direct connect",
+            "bypassed (unpaired device will be discovered via scan)",
         )
