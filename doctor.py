@@ -10,6 +10,7 @@ Exit code: 0 when no check failed, 1 otherwise.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import platform
 import sys
@@ -269,3 +270,18 @@ async def _check_bluez(report: _Report, device_id: str) -> None:
             "direct connect",
             "bypassed (unpaired device will be discovered via scan)",
         )
+
+
+if __name__ == "__main__":
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except Exception:
+        pass
+    from miband_client import _env_device_id
+
+    _dev_id = _env_device_id()
+    _auth = (os.getenv("AUTH_KEY") or "").strip()
+    _out = (os.getenv("OUTPUT_DIR") or "data").strip()
+    sys.exit(asyncio.run(run_doctor(_dev_id, _auth, _out)))

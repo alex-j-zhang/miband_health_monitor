@@ -698,7 +698,10 @@ class MiBand6Client:
         direct_device = await self._direct_connect_target()
         await self._open_client(direct_device, scan_timeout, connect_timeout)
         if self._pairing_agent is not None:
-            await self._pairing_agent.ensure_ready_for_device(self.device_id)
+            target_mac = getattr(self.client, "address", None) or self.device_id
+            if bluez_support.looks_like_mac(target_mac):
+                self._pairing_agent.target_address = bluez_support.normalize_address(target_mac)
+            await self._pairing_agent.ensure_ready_for_device(target_mac)
         await self._apply_mtu()
 
         await self.client.start_notify(UUID_CHAR_CHUNKED_READ, self._on_chunked_notification)

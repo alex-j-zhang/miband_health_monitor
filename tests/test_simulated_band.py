@@ -11,6 +11,8 @@ import time
 
 import pytest
 
+import miband_client
+
 from ecdh_wrapper import backend_name as ecdh_backend_name
 from export_csv import export_database
 from miband_client import (
@@ -384,3 +386,49 @@ async def test_hr_keepalive_loop_tolerates_transient_failure():
         assert not client.disconnected_event.is_set()
     finally:
         await client.disconnect()
+
+
+async def test_run_monitor_history_synced_once_across_reconnects(tmp_path, monkeypatch):
+    disconnect_after = 0.12 if ecdh_backend_name() == "native" else 0.5
+    band = SimulatedBand(auth_key=AUTH_KEY_BYTES, disconnect_after=disconnect_after)
+    sim_client_factory, _ = simulated_factories(band)
+    scanner_class = _make_scanner(MAC)
+
+    def factory(mac: str, key: str) -> MiBand6Client:
+        return MiBand6Client(
+            mac, key, client_factory=sim_client_factory, scanner_factory=scanner_class
+        )
+
+    sync_calls = 0
+
+    async def mock_sync_history(*a, **k):
+        nonlocal sync_calls
+        sync_calls += 1
+
+    monkeypatch.setattr(miband_client, "_sync_band_history", mock_sync_history)
+
+    store = TelemetryStore(tmp_path, backend="sqlite")
+    callbacks = StreamCallbacks(
+        heart_rate=store.record_heart_rate,
+        steps=store.record_steps,
+        imu=store.record_imu,
+    )
+    try:
+        await run_monitor(
+            MAC,
+            AUTH_KEY,
+            duration=0.7,
+            imu=False,
+            callbacks=callbacks,
+            scan_timeout=2.0,
+            reconnect=True,
+            reconnect_initial_delay=0.01,
+            reconnect_max_delay=0.02,
+            sync_history_days=1,
+            client_factory=factory,
+        )
+    finally:
+        store.close()
+
+    assert band.connect_count >= 2, "supervisor should reconnect after link loss"
+    assert sync_calls == 1, "history should only sync once per supervisor lifecycle"

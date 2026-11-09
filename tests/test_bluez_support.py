@@ -449,3 +449,59 @@ async def test_doctor_warns_when_device_is_trusted_but_unpaired(monkeypatch, tmp
     assert code == 0
     assert "is NOT paired/bonded" in text
     assert "bypassed" in text
+
+
+def test_device_info_from_props_includes_rssi_and_bonded():
+    props = {
+        "Address": "FA:12:34:56:78:90",
+        "Name": "Mi Band 6",
+        "Paired": True,
+        "Bonded": True,
+        "Trusted": True,
+        "Connected": False,
+        "RSSI": -68,
+    }
+    info = bluez_support._device_info_from_props("/org/bluez/hci1/dev_FA_12_34_56_78_90", props)
+    assert info["address"] == "FA:12:34:56:78:90"
+    assert info["adapter"] == "hci1"
+    assert info["bonded"] is True
+    assert info["rssi"] == -68
+
+
+async def test_pairing_agent_target_matching_and_adapter_resolution(monkeypatch):
+    # Non-MAC strings should not become bogus target filters
+    agent = bluez_support.BlueZPairingAgent("Mi Smart Band 6")
+    assert agent.target_address is None
+
+    # Dynamically updating target MAC
+    agent.target_address = MAC
+    assert agent.target_address == MAC
+
+    # ensure_ready_for_device dynamically resolves adapter
+    called_adapter = None
+    called_device = None
+
+    async def mock_find_device(address, timeout=0):
+        return {
+            "adapter": "hci2",
+            "path": f"/org/bluez/hci2/dev_{address.replace(':', '_')}",
+        }
+
+    async def mock_pairable(adapter, pairable):
+        nonlocal called_adapter
+        called_adapter = adapter
+        return True
+
+    async def mock_trusted(dev_path, trusted):
+        nonlocal called_device
+        called_device = dev_path
+        return True
+
+    monkeypatch.setattr(bluez_support, "is_bluez_platform", lambda: True)
+    monkeypatch.setattr(bluez_support, "find_device", mock_find_device)
+    monkeypatch.setattr(bluez_support, "set_adapter_pairable", mock_pairable)
+    monkeypatch.setattr(bluez_support, "set_device_trusted", mock_trusted)
+
+    await agent.ensure_ready_for_device(MAC)
+    assert called_adapter == "hci2"
+    assert called_device == f"/org/bluez/hci2/dev_{MAC.replace(':', '_')}"

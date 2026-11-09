@@ -152,6 +152,7 @@ def _device_info_from_props(path: str, props: dict) -> dict:
         "bonded": bool(_unwrap(props.get("Bonded", False))),
         "trusted": bool(_unwrap(props.get("Trusted", False))),
         "connected": bool(_unwrap(props.get("Connected", False))),
+        "rssi": _unwrap(props.get("RSSI")),
         "props": props,
     }
 
@@ -372,7 +373,11 @@ class BlueZPairingAgent:
     """In-process org.bluez.Agent1 pairing agent that auto-accepts auth for the target band."""
 
     def __init__(self, target_address: Optional[str] = None) -> None:
-        self.target_address = normalize_address(target_address or "") if target_address else None
+        self.target_address = (
+            normalize_address(target_address)
+            if target_address and looks_like_mac(target_address)
+            else None
+        )
         self._bus = None
         self._agent = None
         self._agent_path: Optional[str] = None
@@ -392,13 +397,14 @@ class BlueZPairingAgent:
             logger.debug("Cannot import dbus_fast for pairing agent: %s", exc)
             return False
 
-        target = self.target_address
+        agent_parent = self
 
         def _is_target(device_path: str) -> bool:
+            target = agent_parent.target_address
             if not target:
                 return True
             suffix = target.replace(":", "_").upper()
-            return str(device_path).upper().endswith(suffix)
+            return str(device_path).rstrip("/").upper().endswith(suffix)
 
         class _AgentImpl(ServiceInterface):
             def __init__(self):
@@ -527,12 +533,14 @@ class BlueZPairingAgent:
             with contextlib.suppress(Exception):
                 bus.disconnect()
 
-    async def ensure_ready_for_device(self, address: str, adapter: str = "hci0") -> None:
+    async def ensure_ready_for_device(self, address: str, adapter: Optional[str] = None) -> None:
         """Ensure the adapter is pairable and the target device is marked trusted in BlueZ."""
         if not is_bluez_platform():
             return
-        await set_adapter_pairable(adapter, True)
-        dev_path = device_path_for_address(address, adapter)
+        info = await find_device(address)
+        actual_adapter = (info.get("adapter") if info else None) or adapter or "hci0"
+        dev_path = (info.get("path") if info else None) or device_path_for_address(address, actual_adapter)
+        await set_adapter_pairable(actual_adapter, True)
         await set_device_trusted(dev_path, True)
 
 
