@@ -77,7 +77,7 @@ CHUNKED_ATT_OVERHEAD = 3
 #: Upper bound for the Linux "connect the bonded device without scanning"
 #: attempt.  A sleeping / out-of-range band must not stall startup, so a failed
 #: direct attempt falls back to discovery quickly.
-DIRECT_CONNECT_TIMEOUT = 3.5
+DIRECT_CONNECT_TIMEOUT = 10.0
 
 # The band's step-1 auth payload is always 16-byte challenge + 48-byte pubkey.
 AUTH_STEP1_RANDOM_SIZE = 16
