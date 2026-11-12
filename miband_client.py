@@ -653,6 +653,7 @@ class MiBand6Client:
             )
             with contextlib.suppress(Exception):
                 await self.client.disconnect()
+            await bluez_support.disconnect_device(self.device_id)
             self.client = None
             found_device = await self._discover_device(scan_timeout)
             logger.info("Band detected! Establishing BLE link (keep screen awake)...")

@@ -369,6 +369,34 @@ async def set_device_trusted(device_path: str, trusted: bool = True, timeout: fl
         return False
 
 
+async def disconnect_device(address: str, timeout: float = DBUS_TIMEOUT) -> bool:
+    """Explicitly call Disconnect() on the device's BlueZ D-Bus object if connected."""
+    if not is_bluez_platform():
+        return False
+    info = await find_device(address, timeout=timeout)
+    if not info or not info.get("connected") or not info.get("path"):
+        return False
+    from dbus_fast import BusType, Message
+    from dbus_fast.aio import MessageBus
+
+    try:
+        bus = await asyncio.wait_for(MessageBus(bus_type=BusType.SYSTEM).connect(), timeout=timeout)
+        try:
+            msg = Message(
+                destination=BLUEZ_SERVICE,
+                path=info["path"],
+                interface=DEVICE_IFACE,
+                member="Disconnect",
+            )
+            await asyncio.wait_for(bus.call(msg), timeout=timeout)
+            return True
+        finally:
+            bus.disconnect()
+    except Exception as exc:
+        logger.debug("Failed to disconnect BlueZ device: %s", exc)
+        return False
+
+
 class BlueZPairingAgent:
     """In-process org.bluez.Agent1 pairing agent that auto-accepts auth for the target band."""
 

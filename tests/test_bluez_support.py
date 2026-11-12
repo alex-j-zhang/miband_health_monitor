@@ -392,6 +392,17 @@ async def test_connected_device_returns_device_when_connected(monkeypatch):
     assert dev.details["path"] == "/org/bluez/hci0/dev_X"
 
 
+async def test_disconnect_device_off_linux(monkeypatch):
+    monkeypatch.setattr(bluez_support, "is_bluez_platform", lambda: False)
+    assert await bluez_support.disconnect_device(MAC) is False
+
+
+async def test_disconnect_device_when_not_connected(monkeypatch):
+    monkeypatch.setattr(bluez_support, "is_bluez_platform", lambda: True)
+    monkeypatch.setattr(bluez_support, "find_device", lambda *a, **k: asyncio.sleep(0, result=None))
+    assert await bluez_support.disconnect_device(MAC) is False
+
+
 def test_is_transient_connect_error():
     assert bluez_support.is_transient_connect_error(Exception("le-connection-abort-by-local")) is True
     assert bluez_support.is_transient_connect_error(Exception("org.bluez.Error.InProgress")) is True
