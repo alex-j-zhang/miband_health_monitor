@@ -389,7 +389,7 @@ class BlueZPairingAgent:
         if self._registered:
             return True
         try:
-            from dbus_fast import BusType, Message
+            from dbus_fast import BusType, Message, MessageType
             from dbus_fast.aio import MessageBus
             from dbus_fast.errors import DBusError
             from dbus_fast.service import ServiceInterface, method
@@ -476,7 +476,7 @@ class BlueZPairingAgent:
                 body=[self._agent_path, "NoInputNoOutput"],
             )
             reply = await self._bus.call(reg_msg)
-            if reply.message_type != Message.METHOD_RETURN:
+            if reply.message_type != MessageType.METHOD_RETURN:
                 logger.warning("Could not register pairing agent: %s", reply.body)
                 await self.stop()
                 return False
