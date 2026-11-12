@@ -206,6 +206,14 @@ def test_load_samples_roundtrip(tmp_path):
     assert all(set(item) == {"ts", "kind", "intensity", "steps", "heart_rate"} for item in samples)
 
 
+def test_load_samples_missing_database_raises_and_exits(tmp_path):
+    missing = tmp_path / "does_not_exist.db"
+    with pytest.raises(FileNotFoundError):
+        load_samples(missing)
+    assert main(["--db", str(missing)]) == 1
+    assert not missing.exists()
+
+
 def test_cli_json_output(tmp_path, capsys):
     db = _seed_database(tmp_path, series(90, hr=50))
     assert main(["--db", str(db), "--json"]) == 0

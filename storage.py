@@ -23,8 +23,10 @@ Typical use::
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
 import queue
 import sqlite3
 import threading
@@ -166,6 +168,17 @@ def utc_iso(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat(timespec="milliseconds")
 
 
+def secure_path(path: Path, is_dir: bool = False) -> None:
+    """Ensure private permissions (0700 for dirs, 0600 for files) on POSIX."""
+    if os.name == "nt":
+        return
+    with contextlib.suppress(OSError):
+        if is_dir:
+            path.chmod(0o700)
+        else:
+            path.chmod(0o600)
+
+
 def normalize_backend(backend: str) -> str:
     """Validate and normalise a storage backend name."""
     backend = (backend or "").strip().lower()
@@ -208,6 +221,10 @@ class TelemetryStore:
 
         if self._enabled:
             self.output_dir.mkdir(parents=True, exist_ok=True)
+            secure_path(self.output_dir, is_dir=True)
+            for path in [self.db_path, *self.jsonl_paths.values()]:
+                if path.exists():
+                    secure_path(path, is_dir=False)
             self._thread = threading.Thread(
                 target=self._writer_loop, name="miband-storage", daemon=True
             )
@@ -366,13 +383,23 @@ class TelemetryStore:
         try:
             if self._use_jsonl:
                 for kind, path in self.jsonl_paths.items():
+                    if not path.exists():
+                        path.touch(mode=0o600, exist_ok=True)
+                    secure_path(path, is_dir=False)
                     jsonl_handles[kind] = open(path, "a", encoding="utf-8", buffering=1)
             if self._use_sqlite:
+                if not self.db_path.exists():
+                    self.db_path.touch(mode=0o600, exist_ok=True)
+                secure_path(self.db_path, is_dir=False)
                 conn = sqlite3.connect(self.db_path, check_same_thread=False)
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=NORMAL")
                 conn.executescript(_SCHEMA)
                 conn.commit()
+                for extra in (f"{self.db_path}-wal", f"{self.db_path}-shm"):
+                    p = Path(extra)
+                    if p.exists():
+                        secure_path(p, is_dir=False)
 
             while True:
                 try:
@@ -419,6 +446,10 @@ class TelemetryStore:
                     conn.close()
                 except sqlite3.Error:
                     pass
+            for extra in (f"{self.db_path}-wal", f"{self.db_path}-shm"):
+                p = Path(extra)
+                if p.exists():
+                    secure_path(p, is_dir=False)
 
     @staticmethod
     def _insert_sqlite(

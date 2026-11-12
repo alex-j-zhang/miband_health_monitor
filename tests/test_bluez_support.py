@@ -424,6 +424,65 @@ async def test_pairing_agent_lifecycle(monkeypatch):
     await agent.stop()
 
 
+async def test_pairing_agent_start_validates_message_type(monkeypatch):
+    monkeypatch.setattr(bluez_support, "is_bluez_platform", lambda: True)
+
+    class FakeReply:
+        def __init__(self, message_type, body=None):
+            self.message_type = message_type
+            self.body = body or []
+
+    class FakeBus:
+        def __init__(self, reply):
+            self._reply = reply
+            self.exported = []
+
+        def export(self, path, interface):
+            self.exported.append((path, interface))
+
+        async def call(self, msg):
+            return self._reply
+
+        def unexport(self, path, interface):
+            pass
+
+        def disconnect(self):
+            pass
+
+    from dbus_fast import MessageType
+
+    fake_bus_ok = FakeBus(FakeReply(MessageType.METHOD_RETURN))
+
+    class FakeMessageBusOk:
+        def __init__(self, bus_type):
+            pass
+
+        async def connect(self):
+            return fake_bus_ok
+
+    import dbus_fast.aio
+    monkeypatch.setattr(dbus_fast.aio, "MessageBus", FakeMessageBusOk)
+
+    agent = bluez_support.BlueZPairingAgent(MAC)
+    assert await agent.start() is True
+    assert agent._registered is True
+    await agent.stop()
+
+    fake_bus_err = FakeBus(FakeReply(MessageType.ERROR, ["Registration rejected"]))
+
+    class FakeMessageBusErr:
+        def __init__(self, bus_type):
+            pass
+
+        async def connect(self):
+            return fake_bus_err
+
+    monkeypatch.setattr(dbus_fast.aio, "MessageBus", FakeMessageBusErr)
+    agent_err = bluez_support.BlueZPairingAgent(MAC)
+    assert await agent_err.start() is False
+    assert agent_err._registered is False
+
+
 async def test_doctor_warns_when_device_is_trusted_but_unpaired(monkeypatch, tmp_path):
     monkeypatch.setattr(doctor, "is_bluez_platform", lambda: True)
 

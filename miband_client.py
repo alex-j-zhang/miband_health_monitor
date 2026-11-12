@@ -692,8 +692,11 @@ class MiBand6Client:
 
         if bluez_support.is_bluez_platform() and self._client_factory is BleakClient:
             if self._pairing_agent is None:
-                self._pairing_agent = bluez_support.BlueZPairingAgent(self.device_id)
-                await self._pairing_agent.start()
+                agent = bluez_support.BlueZPairingAgent(self.device_id)
+                if await agent.start():
+                    self._pairing_agent = agent
+                else:
+                    logger.debug("BlueZ pairing agent failed to start; continuing without it.")
 
         direct_device = await self._direct_connect_target()
         await self._open_client(direct_device, scan_timeout, connect_timeout)
@@ -1369,8 +1372,21 @@ def _env_optional_int(name: str) -> Optional[int]:
         return None
 
 
+def _secure_env_file() -> None:
+    if os.name == "nt":
+        return
+    env_file = Path(".env")
+    if env_file.is_file():
+        with contextlib.suppress(OSError):
+            mode = env_file.stat().st_mode & 0o777
+            if mode & 0o077:
+                env_file.chmod(0o600)
+                logger.debug("Tightened .env file permissions to 0600")
+
+
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     load_dotenv()
+    _secure_env_file()
     parser = argparse.ArgumentParser(
         description="Stream Mi Band 6 heart rate, steps and IMU data to your computer."
     )

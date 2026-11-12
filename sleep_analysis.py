@@ -210,11 +210,20 @@ def load_samples(
     raw bytes are carried along too, for :func:`score_estimates`. They are off by
     default so the sample dict stays the five fields every other caller expects.
     """
+    path = Path(db_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"SQLite database not found: {path}")
+
     columns = "ts, kind, intensity, steps, heart_rate"
     if include_scores:
         columns += ", sleep, deep_sleep, rem_sleep"
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True)
     try:
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if not table_exists:
+            return []
         rows = conn.execute(f"SELECT {columns} FROM {table} ORDER BY ts").fetchall()
     finally:
         conn.close()
@@ -799,7 +808,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    samples = load_samples(args.db, include_scores=True)
+    try:
+        samples = load_samples(args.db, include_scores=True)
+    except (FileNotFoundError, sqlite3.Error) as exc:
+        print(f"[-] {exc}", file=sys.stderr)
+        return 1
+
     if args.night:
         sessions = detect_sessions(samples)
         samples = [

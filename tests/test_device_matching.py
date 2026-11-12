@@ -124,3 +124,16 @@ async def test_name_based_discovery_connects_to_simulated_band():
         assert client.authenticated is True
     finally:
         await client.disconnect()
+
+
+def test_secure_env_file_tightens_mode(tmp_path, monkeypatch):
+    import os
+    if os.name == "nt":
+        return
+    monkeypatch.chdir(tmp_path)
+    env_file = tmp_path / ".env"
+    env_file.write_text("TEST=1", encoding="utf-8")
+    env_file.chmod(0o664)
+    from miband_client import _secure_env_file
+    _secure_env_file()
+    assert (env_file.stat().st_mode & 0o777) == 0o600

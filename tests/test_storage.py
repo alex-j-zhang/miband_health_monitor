@@ -244,3 +244,24 @@ def test_records_after_close_are_dropped_not_raised(tmp_path):
     store.record_heart_rate(99)  # must not raise inside a BLE callback
     assert store.stats()["dropped"] == 1
     store.close()  # idempotent
+
+
+def test_storage_and_export_permissions(tmp_path):
+    import os
+    if os.name == "nt":
+        pytest.skip("POSIX permission checks do not apply to Windows")
+    data_dir = tmp_path / "data"
+    with TelemetryStore(data_dir, backend="both") as store:
+        store.record_heart_rate(72)
+    assert data_dir.stat().st_mode & 0o777 == 0o700
+    db = data_dir / "mi_band.db"
+    assert db.exists()
+    assert (db.stat().st_mode & 0o777) == 0o600
+    for jsonl in data_dir.glob("*.jsonl"):
+        assert (jsonl.stat().st_mode & 0o777) == 0o600
+
+    csv_out = tmp_path / "csv"
+    export_database(db, csv_out)
+    assert csv_out.stat().st_mode & 0o777 == 0o700
+    for csv_file in csv_out.glob("*.csv"):
+        assert (csv_file.stat().st_mode & 0o777) == 0o600

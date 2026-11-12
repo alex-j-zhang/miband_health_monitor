@@ -319,6 +319,27 @@ def test_cli_builds_and_reports(tmp_path, capsys):
     assert out.exists()
 
 
+def test_missing_database_raises_and_exits(tmp_path):
+    missing = tmp_path / "does_not_exist.db"
+    with pytest.raises(FileNotFoundError):
+        collect(missing)
+    with pytest.raises(FileNotFoundError):
+        build(missing, tmp_path / "out.html")
+    assert main(["--db", str(missing)]) == 1
+    assert not missing.exists()
+
+
+def test_build_file_permissions(tmp_path):
+    import os
+    if os.name == "nt":
+        pytest.skip("POSIX permission checks do not apply to Windows")
+    db = make_db(tmp_path, activity=nights())
+    out = tmp_path / "secure_dir" / "dash.html"
+    build(db, out)
+    assert out.parent.stat().st_mode & 0o777 == 0o700
+    assert out.stat().st_mode & 0o777 == 0o600
+
+
 def test_nonwear_minutes_do_not_paint_as_sleep(tmp_path):
     """The off-wrist night is its own band code, not hours of sleep."""
     activity = nights(minutes=60) + [

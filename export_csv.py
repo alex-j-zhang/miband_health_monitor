@@ -9,7 +9,9 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -71,6 +73,9 @@ def export_table(conn: sqlite3.Connection, table: str, output_path: Path) -> int
     columns = TABLE_COLUMNS[table]
     query = f"SELECT {', '.join(columns)} FROM {table} ORDER BY ts, id"
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        with contextlib.suppress(OSError):
+            output_path.parent.chmod(0o700)
     rows = 0
     with open(output_path, "w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
@@ -78,6 +83,9 @@ def export_table(conn: sqlite3.Connection, table: str, output_path: Path) -> int
         for row in conn.execute(query):
             writer.writerow(row)
             rows += 1
+    if os.name != "nt":
+        with contextlib.suppress(OSError):
+            output_path.chmod(0o600)
     return rows
 
 
@@ -87,6 +95,11 @@ def export_database(db_path: str | Path, output_dir: str | Path) -> dict[str, tu
     output_dir = Path(output_dir)
     if not db_path.is_file():
         raise FileNotFoundError(f"SQLite database not found: {db_path}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        with contextlib.suppress(OSError):
+            output_dir.chmod(0o700)
 
     result: dict[str, tuple[Path, int]] = {}
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)

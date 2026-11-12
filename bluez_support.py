@@ -586,8 +586,9 @@ def describe_ble_error(exc: BaseException) -> str:
 
     if isinstance(exc, TimeoutError):
         return (
-            "timed out (the band is asleep, out of range, or still paired with "
-            "a phone; keep the screen awake and retry)"
+            "timed out (the band is asleep, out of range, still paired with a "
+            "phone, or public broadcasting is off; keep sliding the band screen, "
+            "confirm 'Discoverable' is on in Zepp Life, and retry)"
         )
 
     class_name = type(exc).__name__

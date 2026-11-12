@@ -39,8 +39,9 @@ async def scan_devices(duration_seconds: int = 8) -> None:
     else:
         print("\nNo devices with 'Band/Mi/Xiaomi' in their advertised name were found.")
         print(
-            "Tip: If the band is paired with your phone, disable phone Bluetooth "
-            "so the band advertises."
+            "Tip: If the band is paired with your phone, disable phone Bluetooth, "
+            "ensure 'Discoverable' (公共广播 / 运动心率广播) is enabled in Zepp Life, and "
+            "keep touching/sliding the band screen so it advertises."
         )
 
     print("\n=== All Discovered BLE Devices ===")

@@ -13,9 +13,12 @@ dependency" rule and the visual language of the live dashboard.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
 import sqlite3
 import statistics
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -148,8 +151,12 @@ def collect(
     spo2_sleep_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Gather everything the dashboard needs into one JSON-serialisable dict."""
+    path = Path(db_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"SQLite database not found: {path}")
+
     since = (datetime.now() - timedelta(days=days)).replace(second=0, microsecond=0).timestamp()
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True)
     try:
         activity = []
         if _table_exists(conn, "activity_history"):
@@ -1004,7 +1011,13 @@ def build(
     # ``--output data/reports/dash.html`` is a natural thing to type; don't make
     # the user mkdir first.
     target.parent.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        with contextlib.suppress(OSError):
+            target.parent.chmod(0o700)
     target.write_text(html, encoding="utf-8")
+    if os.name != "nt":
+        with contextlib.suppress(OSError):
+            target.chmod(0o600)
     return target
 
 
@@ -1025,13 +1038,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    target = build(
-        args.db, args.output, days=args.days,
-        spo2_sleep_path=args.spo2_sleep_jsonl,
-    )
-    payload = collect(
-        args.db, days=args.days, spo2_sleep_path=args.spo2_sleep_jsonl
-    )
+    try:
+        target = build(
+            args.db, args.output, days=args.days,
+            spo2_sleep_path=args.spo2_sleep_jsonl,
+        )
+        payload = collect(
+            args.db, days=args.days, spo2_sleep_path=args.spo2_sleep_jsonl
+        )
+    except (FileNotFoundError, sqlite3.Error) as exc:
+        print(f"[-] {exc}", file=sys.stderr)
+        return 1
+
     print(f"Wrote {target} ({target.stat().st_size // 1024} KB)")
     print(
         f"  activity samples: {payload['meta']['activity_samples']}, "
