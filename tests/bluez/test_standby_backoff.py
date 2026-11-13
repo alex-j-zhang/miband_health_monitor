@@ -201,3 +201,67 @@ async def test_doctor_masks_mac_in_hints(
     out = capsys.readouterr().out
     assert real_mac not in out
     assert "bluetoothctl trust <MAC>" in out
+
+
+@pytest.mark.asyncio
+async def test_wait_for_bluez_link_fires_connect_before_introspect_with_device_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call_order: list[str] = []
+    target_path = "/org/bluez/hci0/dev_AA_BB_CC_DD_46_BE"
+
+    class _FakeManager:
+        async def call_get_managed_objects(self) -> dict:
+            call_order.append("GetManagedObjects")
+            return {target_path: {}}
+
+    class _FakeProxy:
+        def get_interface(self, _iface: str) -> _FakeManager:
+            return _FakeManager()
+
+    class _FakeBus:
+        async def connect(self):
+            call_order.append("connect")
+            return self
+
+        async def introspect(self, *_args):
+            # Yield once so the pre-armed Connect future starts before introspect finishes.
+            await asyncio.sleep(0)
+            call_order.append("introspect")
+            return object()
+
+        def get_proxy_object(self, *_args) -> _FakeProxy:
+            return _FakeProxy()
+
+        async def call(self, msg) -> None:
+            call_order.append(getattr(msg, "member", ""))
+            return None
+
+        def disconnect(self) -> None:
+            return None
+
+    fake_dbus_fast = types.ModuleType("dbus_fast")
+    fake_dbus_fast.BusType = SimpleNamespace(SYSTEM=1)
+    fake_dbus_fast.Message = lambda **kw: SimpleNamespace(**kw)
+    fake_dbus_aio = types.ModuleType("dbus_fast.aio")
+    fake_dbus_aio.MessageBus = lambda **_kw: _FakeBus()
+
+    monkeypatch.setitem(sys.modules, "dbus_fast", fake_dbus_fast)
+    monkeypatch.setitem(sys.modules, "dbus_fast.aio", fake_dbus_aio)
+    monkeypatch.setattr(bluez, "is_bluez_platform", lambda: True)
+    monkeypatch.setattr(
+        bluez.devices,
+        "_info_for_address",
+        lambda _objs, _addr: {
+            "path": target_path,
+            "connected": True,
+            "services_resolved": True,
+        },
+    )
+
+    outcome = await bluez.wait_for_bluez_link(
+        "C0:FF:EE:C0:FF:EE", timeout=5.0, device_path=target_path
+    )
+    assert outcome["ready"] is True
+    assert outcome["attempts"] == 1
+    assert call_order[:4] == ["connect", "Connect", "introspect", "GetManagedObjects"]

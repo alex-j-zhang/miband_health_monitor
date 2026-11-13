@@ -155,6 +155,9 @@ class LinkMixin:
             budget,
         )
         device = direct_device
+        # Pre-mark Trusted before scanning so pulse detection does not pay an
+        # extra D-Bus roundtrip before arming Device1.Connect.
+        await self._ensure_bluez_ready(direct_device)
         phases = ["direct", "scan"] if direct_device is not None else ["scan"]
         for phase in phases:
             if phase == "scan":
@@ -184,8 +187,11 @@ class LinkMixin:
                 slice_timeout = min(remaining, direct_cap)
             else:
                 slice_timeout = max(remaining, bluez.BAND_PULSE_PERIOD)
+            details = getattr(device, "details", None)
+            dev_path = details.get("path") if isinstance(details, dict) else None
+            link_kwargs = {"device_path": dev_path} if dev_path else {}
             outcome = await bluez.wait_for_bluez_link(
-                self.device_id, timeout=max(3.0, slice_timeout)
+                self.device_id, timeout=max(3.0, slice_timeout), **link_kwargs
             )
             if not outcome["ready"]:
                 logger.warning(

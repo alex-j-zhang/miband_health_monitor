@@ -176,12 +176,13 @@ class DiscoveryMixin:
                     "Band pulse detected (%s); arming BLE link...",
                     self._describe_target(),
                 )
-                await self._ensure_bluez_ready(found_device)
         finally:
             heartbeat.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat
             await scanner.stop()
+        if found_device is not None:
+            await self._ensure_bluez_ready(found_device)
         return found_device
 
     async def _scan_heartbeat(self, stop_event: asyncio.Event, stats: dict) -> None:

@@ -34,7 +34,8 @@ async def wait_for_bluez_link(
     address: str,
     *,
     timeout: float = BAND_PULSE_PERIOD,
-    poll_interval: float = 0.35,
+    poll_interval: float = 0.2,
+    device_path: Optional[str] = None,
 ) -> dict:
     """Keep one BlueZ Device1.Connect in flight until the band answers.
 
@@ -92,6 +93,21 @@ async def wait_for_bluez_link(
         bus = await asyncio.wait_for(
             MessageBus(bus_type=BusType.SYSTEM).connect(), timeout=DBUS_TIMEOUT
         )
+        if device_path:
+            # Fire Device1.Connect before introspect/GetManagedObjects so the
+            # controller enters initiating state immediately after scan hit.
+            last_path = device_path
+            attempts += 1
+            pending = asyncio.ensure_future(
+                bus.call(
+                    Message(
+                        destination=BLUEZ_SERVICE,
+                        path=device_path,
+                        interface=DEVICE_IFACE,
+                        member="Connect",
+                    )
+                )
+            )
         introspection = await asyncio.wait_for(
             bus.introspect(BLUEZ_SERVICE, OBJECT_MANAGER_PATH), timeout=DBUS_TIMEOUT
         )
