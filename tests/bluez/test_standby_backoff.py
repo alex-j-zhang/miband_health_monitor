@@ -121,6 +121,9 @@ async def test_wait_for_bluez_link_progressive_backoff(
             return _FakeManager()
 
     class _FakeBus:
+        def __init__(self) -> None:
+            self.members: list[str] = []
+
         async def connect(self):
             return self
 
@@ -130,17 +133,19 @@ async def test_wait_for_bluez_link_progressive_backoff(
         def get_proxy_object(self, *_args) -> _FakeProxy:
             return _FakeProxy()
 
-        async def call(self, _msg) -> None:
+        async def call(self, msg) -> None:
+            self.members.append(getattr(msg, "member", ""))
             raise RuntimeError("br-connection-create-socket")
 
         def disconnect(self) -> None:
             return None
 
+    fake_bus = _FakeBus()
     fake_dbus_fast = types.ModuleType("dbus_fast")
     fake_dbus_fast.BusType = SimpleNamespace(SYSTEM=1)
-    fake_dbus_fast.Message = lambda **_kw: object()
+    fake_dbus_fast.Message = lambda **kw: SimpleNamespace(**kw)
     fake_dbus_aio = types.ModuleType("dbus_fast.aio")
-    fake_dbus_aio.MessageBus = lambda **_kw: _FakeBus()
+    fake_dbus_aio.MessageBus = lambda **_kw: fake_bus
 
     monkeypatch.setitem(sys.modules, "dbus_fast", fake_dbus_fast)
     monkeypatch.setitem(sys.modules, "dbus_fast.aio", fake_dbus_aio)
@@ -167,6 +172,7 @@ async def test_wait_for_bluez_link_progressive_backoff(
     assert outcome["reason"] == "connect-timeout"
     error_sleeps = [d for d in sleep_calls if d >= 1.0]
     assert error_sleeps[:4] == [1.0, 2.0, 4.0, 4.0]
+    assert fake_bus.members[-1] == "Disconnect"
 
 
 @pytest.mark.asyncio

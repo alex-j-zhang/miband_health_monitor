@@ -78,6 +78,7 @@ async def wait_for_bluez_link(
     consecutive_errors = 0
     errors: list[str] = []
     bus = None
+    last_path: Optional[str] = None
     pending: Optional[asyncio.Future] = None
 
     def _finish(reason: str, info: Optional[dict] = None) -> dict:
@@ -157,6 +158,7 @@ async def wait_for_bluez_link(
                     else:
                         consecutive_errors = 0
                 if info.get("path") and loop.time() < deadline:
+                    last_path = info["path"]
                     attempts += 1
                     message = Message(
                         destination=BLUEZ_SERVICE,
@@ -178,5 +180,18 @@ async def wait_for_bluez_link(
             with contextlib.suppress(Exception):
                 await asyncio.gather(pending, return_exceptions=True)
         if bus is not None:
+            if not outcome["ready"] and attempts > 0 and last_path:
+                # Cancel any in-flight BlueZ/kernel Device1.Connect so a timed-out
+                # direct probe cannot silently connect during the following scan.
+                with contextlib.suppress(Exception):
+                    cancel_msg = Message(
+                        destination=BLUEZ_SERVICE,
+                        path=last_path,
+                        interface=DEVICE_IFACE,
+                        member="Disconnect",
+                    )
+                    await asyncio.wait_for(
+                        bus.call(cancel_msg), timeout=min(DBUS_TIMEOUT, 2.0)
+                    )
             with contextlib.suppress(Exception):
                 bus.disconnect()
