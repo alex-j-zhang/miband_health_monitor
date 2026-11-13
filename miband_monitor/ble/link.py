@@ -175,15 +175,15 @@ class LinkMixin:
                 scan_deadline = time.monotonic() + scan_budget
                 device = await self._discover_device(scan_timeout, deadline=scan_deadline)
             remaining = deadline - time.monotonic()
-            if remaining < 3.0:
-                break
             await self._ensure_bluez_ready(device)
-            # A bonded-but-absent band must only spend a brief probe in direct
-            # connect before falling back to scanning; once a scan catches a
-            # pulse, allow up to one full BAND_PULSE_PERIOD in standby so a
-            # late scan hit still completes link establishment.
+            # Direct Connect must exceed one kernel LE_CONN_TIMEOUT (40 s) so we
+            # never abort an in-flight LE Create Connection prematurely (which
+            # can wedge adapters like BARROT), while still leaving budget for a
+            # full scan + BAND_PULSE_PERIOD standby if the band needs discovery.
             if phase == "direct":
-                direct_cap = max(DIRECT_CONNECT_TIMEOUT, min(15.0, budget * 0.2))
+                if remaining < 3.0:
+                    break
+                direct_cap = max(bluez.LE_CONN_TIMEOUT + 5.0, budget * 0.55)
                 slice_timeout = min(remaining, direct_cap)
             else:
                 slice_timeout = max(remaining, bluez.BAND_PULSE_PERIOD)

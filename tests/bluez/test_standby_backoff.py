@@ -93,7 +93,7 @@ async def test_open_bluez_link_caps_direct_and_preserves_post_scan_standby(
         connect_timeout=90.0,
     )
     assert len(observed_timeouts) == 2
-    assert observed_timeouts[0] <= 15.0
+    assert bluez.LE_CONN_TIMEOUT <= observed_timeouts[0] < 90.0
     assert observed_timeouts[1] >= bluez.BAND_PULSE_PERIOD
 
 
@@ -173,7 +173,7 @@ async def test_wait_for_bluez_link_progressive_backoff(
     assert outcome["reason"] == "connect-timeout"
     error_sleeps = [d for d in sleep_calls if d >= 1.0]
     assert error_sleeps[:4] == [1.0, 2.0, 4.0, 4.0]
-    assert fake_bus.members[-1] == "Disconnect"
+    assert "Disconnect" not in fake_bus.members
 
 
 @pytest.mark.asyncio

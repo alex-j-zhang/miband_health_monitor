@@ -196,9 +196,10 @@ async def wait_for_bluez_link(
             with contextlib.suppress(Exception):
                 await asyncio.gather(pending, return_exceptions=True)
         if bus is not None:
-            if not outcome["ready"] and attempts > 0 and last_path:
-                # Cancel any in-flight BlueZ/kernel Device1.Connect so a timed-out
-                # direct probe cannot silently connect during the following scan.
+            if outcome.get("reason") == "services-timeout" and last_path:
+                # Only close a link that actually connected but hung during GATT
+                # resolution; never Disconnect on connect-timeout (cancelling a
+                # pending LE Create Connection can deafen BARROT adapters).
                 with contextlib.suppress(Exception):
                     cancel_msg = Message(
                         destination=BLUEZ_SERVICE,
