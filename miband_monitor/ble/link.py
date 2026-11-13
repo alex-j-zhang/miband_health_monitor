@@ -194,11 +194,14 @@ class LinkMixin:
                 self.device_id, timeout=max(3.0, slice_timeout), **link_kwargs
             )
             if not outcome["ready"]:
+                errors = outcome.get("errors") or []
+                detail = f" [{errors[-1]}]" if errors else ""
                 logger.warning(
                     "BlueZ could not link the band in that window (%s after %d "
-                    "connect request(s)).",
+                    "connect request(s))%s.",
                     outcome["reason"],
                     outcome["attempts"],
+                    detail,
                 )
                 continue
             info = outcome["info"] or {}
