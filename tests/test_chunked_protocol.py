@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from miband_client import (
+from miband_monitor.ble import (
     AUTH_STEP1_PAYLOAD_SIZE,
     CHUNKED_DEFAULT_MTU,
     CHUNKED_ENDPOINT_AUTH,
@@ -222,7 +222,7 @@ async def test_reassembly_rejects_unknown_auth_step():
 # report different values than BlueZ).
 # ---------------------------------------------------------------------------
 async def test_client_forwards_configured_mtu_to_chunked_writes(monkeypatch):
-    import miband_client as client_module
+    import miband_monitor.ble.client as client_module
     from sim_band import SimulatedBand, make_simulated_client
 
     captured: list = []
@@ -246,7 +246,7 @@ async def test_client_forwards_configured_mtu_to_chunked_writes(monkeypatch):
 
 
 async def test_client_uses_backend_mtu_when_not_configured(monkeypatch):
-    import miband_client as client_module
+    import miband_monitor.ble.client as client_module
     from sim_band import SimulatedBand, make_simulated_client
 
     captured: list = []

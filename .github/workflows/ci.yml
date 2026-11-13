@@ -25,6 +25,18 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
+      - name: Compile all first-party Python sources
+        run: python -m compileall -q miband_monitor *.py tests tools
+
+      - name: Code size budget (<=300 lines per first-party file)
+        run: python tools/check_file_sizes.py
+
+      - name: Privacy scan (no real device IDs/keys/paths in git)
+        run: python tools/check_privacy.py
+
+      - name: Documentation local-link check
+        run: python tools/check_docs_links.py
+
       - name: Run unit/integration tests (no hardware)
         run: python -m pytest -q
 

@@ -1,7 +1,7 @@
 """Ask the band for arbitrary history types and print the raw start-date reply.
 
-``fetch_payload`` hides the metadata.  The status byte in that reply is what
-tells "the firmware knows this type, there is simply no data" apart from "the
+fetch_payload hides the metadata. The status byte in that reply is what tells
+"the firmware knows this type, there is simply no data" apart from "the
 firmware ignores the request": both produce an empty payload otherwise.
 
 Usage:
@@ -12,16 +12,21 @@ Usage:
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from dotenv import load_dotenv
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from band_history import (  # noqa: E402
+from miband_monitor.ble import (  # noqa: E402
+    MiBand6Client,
+    _env_device_id,
+    is_placeholder_device_id,
+)
+from miband_monitor.config.defaults import DEFAULT_HISTORY_DAYS, ENV_AUTH_KEY  # noqa: E402
+from miband_monitor.config.env import env_str, load_env  # noqa: E402
+from miband_monitor.config.privacy import mask_address  # noqa: E402
+from miband_monitor.history import (  # noqa: E402
     COMMAND_START_DATE,
     UUID_CHAR_ACTIVITY_DATA,
     UUID_CHAR_FETCH,
@@ -29,7 +34,6 @@ from band_history import (  # noqa: E402
     HistoryFetchError,
     encode_fetch_time,
 )
-from miband_client import MiBand6Client  # noqa: E402
 
 
 async def probe(fetcher: BandHistoryFetcher, code: int, since: datetime) -> None:
@@ -54,20 +58,22 @@ async def probe(fetcher: BandHistoryFetcher, code: int, since: datetime) -> None
 
 
 async def main(argv: list[str]) -> int:
-    codes = [int(item, 16) if item.lower().startswith("0x") else int(item, 16) for item in argv] or [0x48]
-    load_dotenv()
-    mac = (os.getenv("DEVICE_ID") or os.getenv("DEVICE_MAC") or "").strip()
-    key = (os.getenv("AUTH_KEY") or "").strip()
-    if not mac or not key:
-        print("DEVICE_MAC / AUTH_KEY missing from .env")
+    codes = [int(item, 16) for item in argv] or [0x48]
+    load_env()
+    mac = _env_device_id()
+    key = env_str(ENV_AUTH_KEY)
+    if is_placeholder_device_id(mac) or not key:
+        print("DEVICE_ID / AUTH_KEY missing from .env")
         return 2
 
     client = MiBand6Client(mac, key)
-    print(f"Connecting to {mac} ...")
+    print(f"Connecting to {mask_address(mac)} ...")
     await client.connect_and_authenticate()
     print("Authenticated.")
     fetcher = BandHistoryFetcher(client)
-    since = (datetime.now() - timedelta(days=7)).replace(second=0, microsecond=0)
+    since = (datetime.now() - timedelta(days=DEFAULT_HISTORY_DAYS)).replace(
+        second=0, microsecond=0
+    )
     print(f"Asking for data since {since:%Y-%m-%d %H:%M}")
     try:
         for code in codes:

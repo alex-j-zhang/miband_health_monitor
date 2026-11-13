@@ -1,21 +1,13 @@
 #!/usr/bin/env python3
 """Capture raw band-side history payloads for real-device validation.
 
-This is a diagnostic companion for ``docs/history_hardware_validation.md``.
+This is a diagnostic companion for docs/validation/history-hardware.md.
 It runs the normal connection + experimental history sync, but intercepts every
-fetched payload and stores it verbatim (``.bin``) together with metadata
-(``.json``) so the protocol can be re-checked offline or attached to a bug
-report.
+fetched payload and stores it verbatim (.bin) together with metadata (.json) so
+the protocol can be re-checked offline or attached to a bug report.
 
-Usage::
-
-    python tools/capture_history_payload.py --days 7 --output validation/payloads
-    python tools/capture_history_payload.py --days 1 --timeout 20
-    python tools/capture_history_payload.py --days 7 --spo2-sleep \
-        --output validation/payloads-26
-
-Requires ``.env`` with ``DEVICE_ID`` (or legacy ``DEVICE_MAC``) / ``AUTH_KEY``
-(see README).
+All written directories and capture files are created with private permissions
+(0700/0600 on POSIX), and the summary file stores only a masked device identifier.
 """
 
 from __future__ import annotations
@@ -24,24 +16,36 @@ import argparse
 import asyncio
 import hashlib
 import json
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-# Allow running as ``python tools/capture_history_payload.py`` from repo root.
+# Allow running as "python tools/capture_history_payload.py" from repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from dotenv import load_dotenv  # noqa: E402
-
-from band_history import (  # noqa: E402
+from miband_monitor.ble import (  # noqa: E402
+    MiBand6Client,
+    _env_device_id,
+    is_placeholder_device_id,
+    normalize_auth_key,
+)
+from miband_monitor.config.defaults import (  # noqa: E402
+    DEFAULT_HISTORY_DAYS,
+    DEFAULT_SCAN_TIMEOUT,
+    ENV_AUTH_KEY,
+)
+from miband_monitor.config.env import env_str, load_env  # noqa: E402
+from miband_monitor.config.privacy import mask_address  # noqa: E402
+from miband_monitor.config.security import secure_directory, secure_file  # noqa: E402
+from miband_monitor.history import (  # noqa: E402
+    DEFAULT_MAX_ROUNDS,
+    DEFAULT_TIMEOUT,
     BandHistoryFetcher,
     FetchDataType,
-    sync_history,
     summarize_history_result,
+    sync_history,
 )
-from miband_client import MiBand6Client, normalize_auth_key  # noqa: E402
 
 
 def _data_type_name(data_type: int) -> str:
@@ -52,10 +56,10 @@ def _data_type_name(data_type: int) -> str:
 
 
 async def _run(args: argparse.Namespace) -> int:
-    load_dotenv()
-    mac = (os.getenv("DEVICE_ID") or os.getenv("DEVICE_MAC") or "").strip()
-    key = (os.getenv("AUTH_KEY") or "").strip()
-    if not mac or not key:
+    load_env()
+    mac = _env_device_id()
+    key = env_str(ENV_AUTH_KEY)
+    if is_placeholder_device_id(mac) or not key:
         print(
             "[-] DEVICE_ID (or legacy DEVICE_MAC) / AUTH_KEY missing from "
             "environment/.env",
@@ -69,7 +73,7 @@ async def _run(args: argparse.Namespace) -> int:
         return 1
 
     output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    secure_directory(output_dir)
 
     original_fetch = BandHistoryFetcher.fetch_payload
     saved: list[dict[str, Any]] = []
@@ -80,6 +84,7 @@ async def _run(args: argparse.Namespace) -> int:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             base = output_dir / f"history_{int(data_type):02x}_{stamp}"
             binary_path = base.with_suffix(".bin")
+            json_path = base.with_suffix(".json")
             meta = {
                 "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                 "data_type": int(data_type),
@@ -93,9 +98,11 @@ async def _run(args: argparse.Namespace) -> int:
                 "payload_sha256": hashlib.sha256(payload).hexdigest(),
             }
             binary_path.write_bytes(payload)
-            base.with_suffix(".json").write_text(
+            secure_file(binary_path)
+            json_path.write_text(
                 json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
             )
+            secure_file(json_path)
             saved.append(meta)
             print(f"[+] captured {len(payload):>6} B  {meta['data_type_name']:<10} -> {binary_path}")
         return payload, start_timestamp
@@ -130,7 +137,7 @@ async def _run(args: argparse.Namespace) -> int:
             pass
 
     summary = {
-        "device_mac": mac,
+        "device_mac": mask_address(mac),
         "days": args.days,
         "fetched": summarize_history_result(result),
         "activity_samples": len(result.activity),
@@ -143,6 +150,7 @@ async def _run(args: argparse.Namespace) -> int:
     }
     summary_path = output_dir / "capture_summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    secure_file(summary_path)
     print(f"[+] Summary: {summary['fetched']}")
     if result.errors:
         for error in result.errors:
@@ -155,12 +163,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Capture raw Mi Band 6 history payloads for protocol validation."
     )
-    parser.add_argument("--days", type=int, default=7, help="history window in days (default: 7)")
+    parser.add_argument(
+        "--days", type=int, default=DEFAULT_HISTORY_DAYS, help="history window in days (default: 7)"
+    )
     parser.add_argument(
         "--output", default="validation/payloads", help="output directory for .bin/.json files"
     )
-    parser.add_argument("--timeout", type=float, default=30.0, help="per-message timeout seconds")
-    parser.add_argument("--max-rounds", type=int, default=5, help="max fetch rounds per data type")
+    parser.add_argument(
+        "--timeout", type=float, default=DEFAULT_TIMEOUT, help="per-message timeout seconds"
+    )
+    parser.add_argument(
+        "--max-rounds", type=int, default=DEFAULT_MAX_ROUNDS, help="max fetch rounds per data type"
+    )
     parser.add_argument(
         "--spo2-sleep",
         action="store_true",
@@ -169,7 +183,9 @@ def main(argv: list[str] | None = None) -> int:
             "layout verified, trailing field semantics still unknown"
         ),
     )
-    parser.add_argument("--scan-timeout", type=float, default=90.0, help="BLE scan timeout seconds")
+    parser.add_argument(
+        "--scan-timeout", type=float, default=DEFAULT_SCAN_TIMEOUT, help="BLE scan timeout seconds"
+    )
     args = parser.parse_args(argv)
     return asyncio.run(_run(args))
 

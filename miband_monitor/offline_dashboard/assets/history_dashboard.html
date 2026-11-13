@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mi Band 6 历史看板</title>
+<style>
+__STYLE__
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>⌚ Mi Band 6 历史看板</h1>
+    <div class="sub" id="range"></div>
+  </header>
+
+  <div class="kpis" id="kpis"></div>
+
+  <section>
+    <h2>睡眠结构 <span class="pill">推导值，非手环直接上报</span></h2>
+    <div class="panel" id="sleepPanel"></div>
+  </section>
+
+  <section>
+    <h2>心率</h2>
+    <div class="panel"><canvas class="line" id="hrChart"></canvas><div class="scales" id="hrScale"></div></div>
+  </section>
+
+  <section>
+    <h2>活动节律</h2>
+    <div class="panel"><canvas class="line" id="actChart"></canvas><div class="scales" id="actScale"></div></div>
+  </section>
+
+  <section>
+    <h2>步数</h2>
+    <div class="panel"><canvas class="line" id="stepChart"></canvas><div class="scales" id="stepScale"></div></div>
+  </section>
+
+  <section>
+    <h2>整夜睡眠血氧 <span class="pill">0x26 · 独立于点测统计</span></h2>
+    <div class="panel">
+      <canvas class="line" id="spo2SleepChart"></canvas>
+      <div class="scales" id="spo2SleepScale"></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>点测血氧 <span class="pill">0x25</span></h2>
+    <div class="panel" id="spo2Panel"></div>
+  </section>
+
+  <footer id="footer"></footer>
+</div>
+
+<script>
+__SCRIPT__
+</script>
+</body>
+</html>

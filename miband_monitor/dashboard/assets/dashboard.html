@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mi Band 6 实时看板</title>
+<style>
+__DASHBOARD_CSS__
+</style>
+</head>
+<body>
+<header>
+  <h1>⌚ Mi Band 6 实时看板</h1>
+  <div id="status"><span class="dot" id="dot"></span><span id="statusText">连接中…</span></div>
+</header>
+
+<main>
+  <section class="cards">
+    <div class="card"><div class="label">心率</div>
+      <div class="value"><span id="hr">--</span><span class="unit">BPM</span></div></div>
+    <div class="card"><div class="label">血氧 SpO₂</div>
+      <div class="value"><span id="spo2">--</span><span class="unit">%</span></div></div>
+    <div class="card"><div class="label">步数</div>
+      <div class="value" id="steps">--</div></div>
+    <div class="card"><div class="label">距离</div>
+      <div class="value"><span id="dist">--</span><span class="unit">m</span></div></div>
+    <div class="card"><div class="label">卡路里</div>
+      <div class="value"><span id="cal">--</span><span class="unit">kcal</span></div></div>
+    <div class="card"><div class="label">IMU 合加速度</div>
+      <div class="value"><span id="imu">--</span><span class="unit">g</span></div></div>
+  </section>
+
+  <section class="charts">
+    <div class="chart"><h2><span>心率趋势</span><span id="hrRange"></span></h2>
+      <canvas id="hrChart"></canvas></div>
+    <div class="chart"><h2><span>血氧趋势</span><span id="spo2Range"></span></h2>
+      <canvas id="spo2Chart"></canvas></div>
+    <div class="chart"><h2><span>步数增长</span><span id="stepsRange"></span></h2>
+      <canvas id="stepsChart"></canvas></div>
+    <div class="chart"><h2><span>IMU 合加速度</span><span id="imuRange"></span></h2>
+      <canvas id="imuChart"></canvas></div>
+  </section>
+</main>
+
+<footer>
+  数据来源：Mi Band 6 BLE 直连 · SSE 实时推送 · 已接收 <span id="events">0</span> 条事件 ·
+  last update <span id="updated">--</span><span id="historyNote"></span>
+</footer>
+
+<script>
+__DASHBOARD_SCRIPT__
+</script>
+</body>
+</html>

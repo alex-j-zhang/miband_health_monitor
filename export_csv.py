@@ -1,146 +1,32 @@
-"""Export Mi Band 6 telemetry from SQLite to CSV files.
+"""Backward-compatible facade for miband_monitor.storage.export_csv.
 
-Usage::
-
-    python export_csv.py                       # data/mi_band.db -> data/csv/
-    python export_csv.py --db data/mi_band.db --output data/csv
+The SQLite-to-CSV exporter now lives in the storage package so its column order
+is derived from the same schema used by the writer. This module keeps the
+historical command line and import path alive.
 """
 
 from __future__ import annotations
 
-import argparse
-import contextlib
-import csv
-import os
-import sqlite3
 import sys
-from pathlib import Path
 
-# Column order of the exported CSV files (must match storage.py schema).
-TABLE_COLUMNS = {
-    "heart_rate": ["id", "ts", "iso_time", "bpm"],
-    "steps": ["id", "ts", "iso_time", "steps", "distance_m", "calories"],
-    "imu": [
-        "id",
-        "ts",
-        "iso_time",
-        "sensor_type",
-        "sequence",
-        "sample_index",
-        "x_raw",
-        "y_raw",
-        "z_raw",
-        "ax_g",
-        "ay_g",
-        "az_g",
-        "ax_ms2",
-        "ay_ms2",
-        "az_ms2",
-    ],
-    "spo2": ["id", "ts", "iso_time", "spo2", "auto_measure"],
-    "activity_history": [
-        "id",
-        "ts",
-        "iso_time",
-        "kind",
-        "intensity",
-        "steps",
-        "heart_rate",
-        "unknown1",
-        "sleep",
-        "deep_sleep",
-        "rem_sleep",
-    ],
-    "spo2_sleep": [
-        "id",
-        "ts",
-        "iso_time",
-        "spo2",
-        "duration",
-        "spo2_high",
-        "spo2_low",
-        "signal_quality",
-        "extend",
-    ],
-}
+from miband_monitor.storage.export_csv import *  # noqa: F401,F403
+from miband_monitor.storage.export_csv import (
+    DEFAULT_DB,
+    DEFAULT_OUTPUT,
+    TABLE_COLUMNS,
+    export_database,
+    export_table,
+    main,
+)
 
-DEFAULT_DB = Path("data") / "mi_band.db"
-DEFAULT_OUTPUT = Path("data") / "csv"
-
-
-def export_table(conn: sqlite3.Connection, table: str, output_path: Path) -> int:
-    """Export one table to CSV; returns the number of written data rows."""
-    columns = TABLE_COLUMNS[table]
-    query = f"SELECT {', '.join(columns)} FROM {table} ORDER BY ts, id"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if os.name != "nt":
-        with contextlib.suppress(OSError):
-            output_path.parent.chmod(0o700)
-    rows = 0
-    with open(output_path, "w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(columns)
-        for row in conn.execute(query):
-            writer.writerow(row)
-            rows += 1
-    if os.name != "nt":
-        with contextlib.suppress(OSError):
-            output_path.chmod(0o600)
-    return rows
-
-
-def export_database(db_path: str | Path, output_dir: str | Path) -> dict[str, tuple[Path, int]]:
-    """Export every known table; returns ``{table: (csv_path, rows)}``."""
-    db_path = Path(db_path)
-    output_dir = Path(output_dir)
-    if not db_path.is_file():
-        raise FileNotFoundError(f"SQLite database not found: {db_path}")
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if os.name != "nt":
-        with contextlib.suppress(OSError):
-            output_dir.chmod(0o700)
-
-    result: dict[str, tuple[Path, int]] = {}
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    try:
-        existing = {
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
-        }
-        for table, columns in TABLE_COLUMNS.items():
-            if table not in existing:
-                continue
-            path = output_dir / f"{table}.csv"
-            result[table] = (path, export_table(conn, table, path))
-    finally:
-        conn.close()
-    return result
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Export Mi Band 6 SQLite telemetry to CSV.")
-    parser.add_argument("--db", default=str(DEFAULT_DB), help="SQLite database path")
-    parser.add_argument("--output", default=str(DEFAULT_OUTPUT), help="CSV output directory")
-    args = parser.parse_args(argv)
-
-    try:
-        exported = export_database(args.db, args.output)
-    except (FileNotFoundError, sqlite3.Error) as exc:
-        print(f"[-] Export failed: {exc}", file=sys.stderr)
-        return 1
-
-    if not exported:
-        print(f"[-] No telemetry tables found in {args.db}", file=sys.stderr)
-        return 1
-
-    print(f"[+] Exported {len(exported)} table(s) from {args.db}:")
-    for table, (path, rows) in exported.items():
-        print(f"    {table:<12} {rows:>8} rows -> {path}")
-    return 0
-
+__all__ = [
+    "DEFAULT_DB",
+    "DEFAULT_OUTPUT",
+    "TABLE_COLUMNS",
+    "export_database",
+    "export_table",
+    "main",
+]
 
 if __name__ == "__main__":
     sys.exit(main())

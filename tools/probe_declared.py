@@ -1,9 +1,9 @@
 """Probe the band's declared activity-history window without consuming it.
 
-``01 <type> <6B calendar><reason><tz>`` only asks the firmware "how much do you
-still have since this moment".  It does **not** stream payload and does **not**
-send ``03`` (the receipt after which the firmware may reclaim the data), so a
-probe session leaves the band's stores untouched.
+"01 <type> <6B calendar><reason><tz>" only asks the firmware "how much do you
+still have since this moment". It does NOT stream payload and does NOT send 03
+(the receipt after which the firmware may reclaim the data), so a probe session
+leaves the band's stores untouched.
 
 Usage:
     python tools/probe_declared.py            # default grid, in minutes
@@ -14,17 +14,26 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from dotenv import load_dotenv  # noqa: E402
-
-from band_history import (  # noqa: E402
+from miband_monitor.ble import (  # noqa: E402
+    MiBand6Client,
+    _env_device_id,
+    is_placeholder_device_id,
+)
+from miband_monitor.config.defaults import (  # noqa: E402
+    DEFAULT_SCAN_TIMEOUT,
+    ENV_AUTH_KEY,
+    ENV_DEVICE_NAME,
+)
+from miband_monitor.config.env import env_str, load_env  # noqa: E402
+from miband_monitor.history import (  # noqa: E402
     COMMAND_START_DATE,
     RESPONSE,
     SUCCESS,
@@ -34,7 +43,6 @@ from band_history import (  # noqa: E402
     decode_fetch_time,
     encode_fetch_time,
 )
-from miband_client import MiBand6Client  # noqa: E402
 
 DEFAULT_HOURS = [168, 96, 72, 48, 40, 33, 32, 24, 12, 6]
 
@@ -69,17 +77,22 @@ async def probe(fetcher: BandHistoryFetcher, data_type: FetchDataType, since: da
 
 async def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("hours", nargs="*", type=float, default=None,
-                        help="hours back to ask about (default: a fixed grid)")
+    parser.add_argument(
+        "hours",
+        nargs="*",
+        type=float,
+        default=None,
+        help="hours back to ask about (default: a fixed grid)",
+    )
     parser.add_argument("--device-id", default=None)
-    parser.add_argument("--scan-timeout", type=float, default=90.0)
+    parser.add_argument("--scan-timeout", type=float, default=DEFAULT_SCAN_TIMEOUT)
     args = parser.parse_args()
 
-    load_dotenv(os.path.join(ROOT, ".env"))
-    device_id = args.device_id or os.getenv("DEVICE_ID") or os.getenv("DEVICE_MAC")
-    auth_key = os.getenv("AUTH_KEY")
-    if not device_id or not auth_key:
-        print("DEVICE_MAC / AUTH_KEY missing from .env", file=sys.stderr)
+    load_env(ROOT / ".env")
+    device_id = (args.device_id or _env_device_id()).strip()
+    auth_key = env_str(ENV_AUTH_KEY)
+    if is_placeholder_device_id(device_id) or not auth_key:
+        print("DEVICE_ID / AUTH_KEY missing from .env", file=sys.stderr)
         return 2
 
     hours = args.hours or DEFAULT_HOURS
@@ -94,8 +107,10 @@ async def main() -> int:
     for h in hours:
         since = now - timedelta(hours=h)
         reading, error = None, None
-        for attempt in range(3):
-            client = MiBand6Client(device_id, auth_key, device_name=os.getenv("DEVICE_NAME"))
+        for _attempt in range(3):
+            client = MiBand6Client(
+                device_id, auth_key, device_name=env_str(ENV_DEVICE_NAME) or None
+            )
             try:
                 await client.connect_and_authenticate(scan_timeout=args.scan_timeout)
                 fetcher = BandHistoryFetcher(client)

@@ -1,0 +1,35 @@
+  :root {
+    --bg: #0f1216; --panel: #171c22; --line: #2a323c; --text: #e6edf3;
+    --muted: #8b98a5; --hr: #ff5c7a; --spo2: #38bdf8; --steps: #4ade80; --imu: #fbbf24;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 20px; border-bottom: 1px solid var(--line);
+  }
+  h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  #status { display: flex; align-items: center; gap: 6px; margin-left: auto;
+            color: var(--muted); font-size: 12px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #64748b; }
+  .dot.on { background: #22c55e; box-shadow: 0 0 8px #22c55e; }
+  .dot.err { background: #ef4444; }
+  main { padding: 16px 20px; display: grid; gap: 14px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .card .label { color: var(--muted); font-size: 12px; }
+  .card .value { font-size: 26px; font-weight: 700; margin-top: 2px; }
+  .card .unit { font-size: 12px; color: var(--muted); margin-left: 4px; font-weight: 400; }
+  .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }
+  .chart { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+  .chart h2 {
+    font-size: 13px; margin: 0 0 8px; color: var(--muted); font-weight: 500;
+    display: flex; justify-content: space-between;
+  }
+  canvas { width: 100%; height: 140px; display: block; }
+  footer { padding: 10px 20px 20px; color: var(--muted); font-size: 12px; }
+  code { color: var(--spo2); }

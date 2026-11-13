@@ -1,13 +1,12 @@
-"""Probe the band for the Huami ``SLEEP_SESSION`` history type (0x48).
+"""Probe the band for the Huami SLEEP_SESSION history type (0x48).
 
-Gadgetbridge decodes ``0x48`` as a list of sleep sessions and never requests it
-from a Mi Band 6, because ``MiBand6Coordinator`` leaves
-``supportsSleepScore()`` at the ``false`` default that
-``AbstractDeviceCoordinator`` provides.  The band may or may not answer anyway,
-and if it does, the payload carries what the activity stream cannot: per-stage
-sleep spans and a sleep score.
+Gadgetbridge decodes 0x48 as a list of sleep sessions and never requests it
+from a Mi Band 6, because MiBand6Coordinator leaves supportsSleepScore() at the
+false default that AbstractDeviceCoordinator provides. The band may or may not
+answer anyway, and if it does, the payload carries what the activity stream
+cannot: per-stage sleep spans and a sleep score.
 
-Record layout, from ``HuamiSleepSessionSampleProvider.SleepSession``:
+Record layout, from HuamiSleepSessionSampleProvider.SleepSession:
 
     0x000  u32  session timestamp (seconds)
     0x004  u32  midnight boundary of the day (seconds, local)
@@ -32,20 +31,28 @@ Run with the band awake and nearby:
 from __future__ import annotations
 
 import asyncio
-import os
 import struct
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from dotenv import load_dotenv
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from band_history import BandHistoryFetcher, HistoryFetchError  # noqa: E402
-from miband_client import MiBand6Client  # noqa: E402
+from miband_monitor.ble import (  # noqa: E402
+    MiBand6Client,
+    _env_device_id,
+    is_placeholder_device_id,
+)
+from miband_monitor.config.defaults import DEFAULT_HISTORY_DAYS, ENV_AUTH_KEY  # noqa: E402
+from miband_monitor.config.env import env_str, load_env  # noqa: E402
+from miband_monitor.config.privacy import mask_address  # noqa: E402
+from miband_monitor.history import (  # noqa: E402
+    BandHistoryFetcher,
+    FetchDataType,
+    HistoryFetchError,
+)
 
-SLEEP_SESSION = 0x48
+SLEEP_SESSION = FetchDataType.SLEEP_SESSION
 RECORD_SIZE = 594
 STAGE_NAMES = {4: "light", 5: "deep", 7: "awake", 8: "rem"}
 
@@ -86,22 +93,22 @@ def parse_sleep_session(record: bytes) -> dict:
 
 
 async def main() -> int:
-    load_dotenv()
-    mac = (os.getenv("DEVICE_ID") or os.getenv("DEVICE_MAC") or "").strip()
-    key = (os.getenv("AUTH_KEY") or "").strip()
-    if not mac or not key:
-        print("DEVICE_MAC / AUTH_KEY missing from .env")
+    load_env()
+    mac = _env_device_id()
+    key = env_str(ENV_AUTH_KEY)
+    if is_placeholder_device_id(mac) or not key:
+        print("DEVICE_ID / AUTH_KEY missing from .env")
         return 2
 
     client = MiBand6Client(mac, key)
     fetcher = BandHistoryFetcher(client)
-    since = datetime.now() - timedelta(days=7)
+    since = datetime.now() - timedelta(days=DEFAULT_HISTORY_DAYS)
 
-    print(f"Connecting to {mac} ...")
+    print(f"Connecting to {mask_address(mac)} ...")
     await client.connect_and_authenticate()
     print("Authenticated.")
     try:
-        print(f"Requesting fetch type {SLEEP_SESSION:#04x} since {since:%Y-%m-%d %H:%M} ...")
+        print(f"Requesting fetch type {int(SLEEP_SESSION):#04x} since {since:%Y-%m-%d %H:%M} ...")
         payload, start_ts = await fetcher.fetch_payload(SLEEP_SESSION, since)
     except HistoryFetchError as exc:
         print(f"Band refused or failed: {exc}")
