@@ -165,8 +165,11 @@ class LinkMixin:
                     "Waiting for the band's next broadcast pulse at %s...",
                     self._describe_target(),
                 )
-                # Keep at least ~20 s of the budget for the standby loop itself.
-                scan_deadline = deadline - 20.0
+                # Give discovery a full pulse period (capped by scan_timeout) even
+                # after a direct probe; wait_for_bluez_link below gets its own
+                # BAND_PULSE_PERIOD standby window once a pulse arrives.
+                scan_budget = max(remaining, min(float(scan_timeout), bluez.BAND_PULSE_PERIOD))
+                scan_deadline = time.monotonic() + scan_budget
                 device = await self._discover_device(scan_timeout, deadline=scan_deadline)
             remaining = deadline - time.monotonic()
             if remaining < 3.0:

@@ -77,6 +77,7 @@ async def test_open_bluez_link_caps_direct_and_preserves_post_scan_standby(
 
     async def fake_discover(_scan_timeout: float, deadline: float | None = None):
         assert deadline is not None
+        assert deadline - now[0] >= bluez.BAND_PULSE_PERIOD
         now[0] += 55.0
         return SimpleNamespace(address="C0:FF:EE:C0:FF:EE")
 
